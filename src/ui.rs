@@ -84,7 +84,12 @@ fn modal(f: &mut Frame, area: Rect, app: &App) {
             });
             (" Commit ", lines)
         }
-        Modal::Push { question, .. } => (" Push ", vec![Line::raw(""), Line::from(question.clone().bold()), Line::raw("")]),
+        Modal::Confirm { title, question, .. } => {
+            let mut lines = vec![Line::raw("")];
+            lines.extend(question.split('\n').map(|l| Line::from(l.to_string().bold())));
+            lines.push(Line::raw(""));
+            (*title, lines)
+        }
     };
     let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(inner_w)).sum();
     let height = (rows as u16 + 2).min(area.height);
@@ -161,7 +166,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("alt+⏎", "newline"),
             ("esc", "cancel"),
         ],
-        _ if app.modal.is_some() => &[("y/⏎", "push"), ("n/esc", "cancel")],
+        _ if app.modal.is_some() => &[("y/⏎", "yes"), ("n/esc", "cancel")],
         _ if app.filtering => &[("type", "filter"), ("⏎", "done"), ("esc", "clear")],
         View::List => &[
             ("↑↓", "move"),
@@ -170,6 +175,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("S", "summarize all"),
             ("c", "commit"),
             ("P", "push"),
+            ("u", "pull"),
             ("d", "diff"),
             ("a", "all/changed"),
             ("x", "ignore"),
@@ -186,6 +192,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("s", "re-summarize"),
             ("c", "commit"),
             ("P", "push"),
+            ("u", "pull"),
             ("d", "diff"),
             ("o", "finder"),
             ("r", "refresh"),

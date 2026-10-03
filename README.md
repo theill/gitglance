@@ -17,6 +17,7 @@ It uses the `git` CLI (`status --porcelain=v2`, with `--no-optional-locks`), so 
 | `s` / `S` | AI summary for this repo / for every listed repo without one |
 | `c` | commit everything and push (see below) |
 | `P` | push commits that are already made (asks first) |
+| `u` | pull commits you're behind on (see below) |
 | `d` | full diff |
 | `a` | toggle repos with changes ↔ all repos |
 | `/` | filter by name |
@@ -39,6 +40,15 @@ Columns: **STATE** `S` staged, `M` modified, `?` untracked, `U` conflicts, `≡`
 - A branch with no upstream is pushed to `origin` with `--set-upstream`. A repo with no remote is only committed.
 
 `P` pushes commits that are already made, after a y/n confirmation. Git never prompts for credentials here, so a push that needs a password fails with an error instead of hanging.
+
+## Pulling (`u`)
+
+`↓N` in SYNC means the upstream has N commits you don't have yet, as of the last fetch (`f` fetches every repo).
+
+- **Only behind:** `u` fast-forwards right away (`git pull --ff-only --autostash`), with no question asked, since nothing can be lost.
+- **Diverged** (`↑2 ↓1`): `u` asks, then rebases your local commits on top (`git pull --rebase --autostash`). Push afterwards with `P`. If the rebase hits a conflict, it's aborted automatically and nothing changes; the message tells you the command to run by hand.
+
+Uncommitted changes are stashed for the pull and restored afterwards.
 
 ## Ignoring folders
 

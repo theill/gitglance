@@ -27,7 +27,7 @@ one per line, gitignore style: a name without / matches a folder at any depth
 (`archive`, `*-site`), a path with / is relative to DIR (`unops/*`).
 
 Press c to commit everything in a repo (Claude drafts the message) and push,
-or P to push commits that are already made.
+P to push commits that are already made, or u to pull in commits you are behind on.
 
 AI summaries run `claude -p` (model from GITGLANCE_MODEL, default haiku) and are
 cached in ~/.cache/gitglance. Set GITGLANCE_AI_CMD to use any other command that
@@ -94,7 +94,13 @@ enum Msg {
 
 pub enum Modal {
     Commit { path: PathBuf, message: String, push: bool, generating: bool },
-    Push { path: PathBuf, question: String },
+    Confirm { path: PathBuf, title: &'static str, question: String, action: Action },
+}
+
+#[derive(Clone, Copy)]
+pub enum Action {
+    Push,
+    Rebase,
 }
 
 pub enum View {
@@ -353,7 +359,38 @@ impl App {
         };
         let n = s.unpushed_count;
         let question = format!("Push {n} commit{} on {} to {target}?", if n == 1 { "" } else { "s" }, s.branch);
-        self.modal = Some(Modal::Push { path: r.path.clone(), question });
+        self.modal = Some(Modal::Confirm { path: r.path.clone(), title: " Push ", question, action: Action::Push });
+    }
+
+    fn update(&mut self, i: usize) {
+        let r = &self.repos[i];
+        let Some(Ok(s)) = &r.status else { return };
+        if !s.tracking {
+            self.notice = Some(format!("{}: {} has no upstream to pull from", r.name, s.branch));
+            return;
+        }
+        if s.behind == 0 {
+            self.notice = Some(format!("{}: already up to date with {} (f fetches the latest)", r.name, s.upstream.as_deref().unwrap_or("upstream")));
+            return;
+        }
+        let behind = s.behind;
+        let plural = |n: u32| if n == 1 { "" } else { "s" };
+        if s.ahead == 0 {
+            self.start_op(r.path.clone(), move |p| {
+                git::pull(p, false).map(|_| format!("pulled {behind} commit{}", plural(behind)))
+            });
+            return;
+        }
+        let question = format!(
+            "{} has diverged: {} local commit{} and {behind} new commit{} on {}.\n\nRebase your local commit{} on top (git pull --rebase --autostash)? Push afterwards with P.",
+            s.branch,
+            s.ahead,
+            plural(s.ahead),
+            plural(behind),
+            s.upstream.as_deref().unwrap_or("upstream"),
+            plural(s.ahead),
+        );
+        self.modal = Some(Modal::Confirm { path: r.path.clone(), title: " Update ", question, action: Action::Rebase });
     }
 
     /// Runs a git operation off the UI thread, then rescans the repo.
@@ -387,11 +424,16 @@ impl App {
                 KeyCode::Char(c) if !ctrl => message.push(c),
                 _ => {}
             },
-            Some(Modal::Push { path, .. }) => match k.code {
+            Some(Modal::Confirm { path, action, .. }) => match k.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    let path = path.clone();
+                    let (path, action) = (path.clone(), *action);
                     self.modal = None;
-                    self.start_op(path, |p| git::status(p).and_then(|s| git::push(p, &s)));
+                    match action {
+                        Action::Push => self.start_op(path, |p| git::status(p).and_then(|s| git::push(p, &s))),
+                        Action::Rebase => self.start_op(path, |p| {
+                            git::pull(p, true).map(|_| "rebased onto upstream, press P to push".to_string())
+                        }),
+                    }
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.modal = None,
                 _ => {}
@@ -561,6 +603,11 @@ impl App {
                     self.confirm_push(i);
                 }
             }
+            KeyCode::Char('u') => {
+                if let Some(i) = self.selected_idx() {
+                    self.update(i);
+                }
+            }
             KeyCode::Char('d') => {
                 if let Some(i) = self.selected_idx() {
                     self.open_diff(i);
@@ -634,6 +681,11 @@ impl App {
             KeyCode::Char('P') => {
                 if let Some(i) = self.repo_idx(&path) {
                     self.confirm_push(i);
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Some(i) = self.repo_idx(&path) {
+                    self.update(i);
                 }
             }
             KeyCode::Char('o') => {

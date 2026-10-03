@@ -74,6 +74,7 @@ fn run(repo: &Path, args: &[&str], input: Option<&str>) -> Result<String, String
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
         .env("LC_ALL", "C")
+        .env("GIT_EDITOR", "true")
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -99,6 +100,34 @@ pub fn commit_all(repo: &Path, message: &str) -> Result<String, String> {
     git(repo, &["add", "-A"])?;
     run(repo, &["commit", "--quiet", "--file=-"], Some(message))?;
     Ok(git(repo, &["rev-parse", "--short", "HEAD"])?.trim().to_string())
+}
+
+/// Brings in commits from the upstream. Fast-forward only, or a rebase of local commits when the branch has
+/// diverged. A rebase that hits a conflict is aborted, so the repo is never left half-rebased.
+pub fn pull(repo: &Path, rebase: bool) -> Result<(), String> {
+    let mode = if rebase { "--rebase" } else { "--ff-only" };
+    match git(repo, &["pull", "--quiet", mode, "--autostash"]) {
+        Ok(_) => Ok(()),
+        Err(_) if rebase && rebase_in_progress(repo) => {
+            let _ = git(repo, &["rebase", "--abort"]);
+            Err(format!(
+                "the rebase hit a conflict, so it was undone and nothing changed. Resolve it by hand: cd {} && git pull --rebase",
+                repo.display()
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn rebase_in_progress(repo: &Path) -> bool {
+    ["rebase-merge", "rebase-apply"].iter().any(|dir| {
+        git(repo, &["rev-parse", "--git-path", dir])
+            .map(|p| {
+                let p = PathBuf::from(p.trim());
+                if p.is_relative() { repo.join(p) } else { p }.exists()
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Pushes the current branch, setting an upstream on first push.
