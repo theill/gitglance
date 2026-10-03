@@ -102,7 +102,7 @@ fn context_with_budget(repo: &Path, s: &Status, diff_budget: usize) -> String {
         for f in files.iter().take(200) {
             let _ = writeln!(c, "{f}");
         }
-        for f in files.iter().take(15) {
+        for f in files.iter().filter(|f| !git::looks_secret(f)).take(15) {
             if budget == 0 {
                 break;
             }
@@ -231,4 +231,29 @@ pub fn headline(summary: &str) -> &str {
     let line = line.trim_start_matches(|c: char| c == '#' || c == '*' || c == '-' || c.is_whitespace());
     let line = line.strip_prefix("Headline:").unwrap_or(line);
     line.trim().trim_end_matches("**")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn secrets_never_reach_the_prompt() {
+        let dir = std::env::temp_dir().join(format!("gitglance-secret-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |cmd: &str| assert!(Command::new("sh").arg("-c").arg(cmd).current_dir(&dir).status().unwrap().success());
+        sh("git init -q && git config user.email t@t && git config user.name t");
+        sh("echo A=1 > .env && echo code > app.txt && git add -A && git commit -qm init");
+        sh("echo A=SUPERSECRET1 > .env && echo more >> app.txt");
+        sh("echo SUPERSECRET2 > AuthKey_X.p8 && echo SUPERSECRET3 > .env.local && echo hello > notes.md");
+
+        let s = git::status(&dir).unwrap();
+        let c = build_context(&dir, &s);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!c.contains("SUPERSECRET"), "secret leaked into prompt:\n{c}");
+        assert!(c.contains("+more") && c.contains("hello"), "ordinary changes should still be included:\n{c}");
+        assert!(c.contains("AuthKey_X.p8"), "secret files are still listed by name");
+    }
 }

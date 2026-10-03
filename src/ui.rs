@@ -40,11 +40,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     header(f, head, app);
     match app.view {
         View::List => list(f, body, app),
-        View::Detail { ref path, scroll } => {
-            if let Some(i) = app.repo_idx(path) {
-                detail(f, body, &app.repos[i], app.tick, scroll);
-            }
-        }
+        View::Detail { .. } => detail(f, body, app),
         View::Diff { ref title, ref lines, scroll, .. } => diff(f, body, title, lines, scroll),
     }
     modal(f, body, app);
@@ -187,7 +183,8 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
         ],
         View::Detail { .. } => &[
             ("esc", "back"),
-            ("↑↓", "scroll"),
+            ("↑↓", "select"),
+            ("⏎", "open"),
             ("n/p", "next/prev repo"),
             ("s", "re-summarize"),
             ("c", "commit"),
@@ -379,7 +376,48 @@ fn section(lines: &mut Vec<Line<'static>>, title: String, hint: &str) {
     lines.push(Line::from(vec![format!("── {title}").cyan().bold(), hint.dark_gray()]));
 }
 
-fn detail(f: &mut Frame, area: Rect, r: &Repo, tick: usize, scroll: u16) {
+fn detail(f: &mut Frame, area: Rect, app: &mut App) {
+    let View::Detail { ref path, scroll, sel } = app.view else { return };
+    let Some(i) = app.repo_idx(&path.clone()) else { return };
+    let (lines, items) = detail_lines(&app.repos[i], app.tick, sel);
+
+    // Keep the highlighted item on screen, estimating wrapped rows like the Paragraph will.
+    let width = area.width.saturating_sub(4).max(1) as usize;
+    let height = area.height.saturating_sub(1).max(1) as usize;
+    let mut scroll = scroll as usize;
+    if let Some(&line) = sel.and_then(|s| items.get(s)) {
+        let row: usize = lines[..line].iter().map(|l| l.width().max(1).div_ceil(width)).sum();
+        if row < scroll {
+            scroll = row.saturating_sub(1);
+        } else if row + 2 > scroll + height {
+            scroll = (row + 2).saturating_sub(height);
+        }
+    }
+    if let View::Detail { scroll: s, .. } = &mut app.view {
+        *s = scroll as u16;
+    }
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll as u16, 0))
+        .block(Block::new().padding(Padding::new(2, 2, 1, 0)));
+    f.render_widget(p, area);
+}
+
+/// A selectable row on the detail page: a bar marks and a background highlights the selection.
+fn item_line(spans: Vec<Span<'static>>, selected: bool) -> Line<'static> {
+    let mut all = vec![if selected { "▌ ".cyan().bold() } else { "  ".into() }];
+    all.extend(spans);
+    let line = Line::from(all);
+    if selected {
+        line.style(Style::new().bg(SELECTED_BG))
+    } else {
+        line
+    }
+}
+
+/// The page's lines plus the line index of each selectable item (see `detail_items`).
+fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>>, Vec<usize>) {
+    let mut items = Vec::new();
     let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
         r.name.clone().yellow().bold(),
         "   ".into(),
@@ -388,11 +426,11 @@ fn detail(f: &mut Frame, area: Rect, r: &Repo, tick: usize, scroll: u16) {
     let s = match &r.status {
         None => {
             lines.push(Line::from(format!("{} scanning…", spin(tick)).cyan()));
-            return render_detail(f, area, lines, scroll);
+            return (lines, items);
         }
         Some(Err(e)) => {
             lines.push(Line::from(format!("git error: {e}").red()));
-            return render_detail(f, area, lines, scroll);
+            return (lines, items);
         }
         Some(Ok(s)) => s,
     };
@@ -411,7 +449,11 @@ fn detail(f: &mut Frame, area: Rect, r: &Repo, tick: usize, scroll: u16) {
     if let Some(ts) = s.last_commit_ts {
         lines.push(Line::from(vec![
             "last commit ".dark_gray(),
-            format!("{} ago  ", ago(ts)).into(),
+            match ago(ts).as_str() {
+                "now" => "just now  ".to_string(),
+                a => format!("{a} ago  "),
+            }
+            .into(),
             s.last_commit_subject.clone().italic(),
         ]));
     }
@@ -446,10 +488,12 @@ fn detail(f: &mut Frame, area: Rect, r: &Repo, tick: usize, scroll: u16) {
     }
 
     if s.unpushed_count > 0 {
-        section(&mut lines, format!("Unpushed commits ({})", s.unpushed_count), "");
+        section(&mut lines, format!("Unpushed commits ({})", s.unpushed_count), "⏎ shows a commit");
         for c in &s.unpushed {
             let (hash, msg) = c.split_once(' ').unwrap_or((c, ""));
-            lines.push(Line::from(vec![hash.to_string().yellow(), " ".into(), msg.to_string().into()]));
+            let selected = sel == Some(items.len());
+            items.push(lines.len());
+            lines.push(item_line(vec![hash.to_string().yellow(), " ".into(), msg.to_string().into()], selected));
         }
         if s.unpushed_count as usize > s.unpushed.len() {
             lines.push(Line::from(format!("… and {} more", s.unpushed_count as usize - s.unpushed.len()).dark_gray()));
@@ -457,7 +501,7 @@ fn detail(f: &mut Frame, area: Rect, r: &Repo, tick: usize, scroll: u16) {
     }
 
     if !s.files.is_empty() {
-        section(&mut lines, format!("Changes ({})", s.files.len()), "d for full diff");
+        section(&mut lines, format!("Changes ({})", s.files.len()), "⏎ shows a file, d everything");
         for fc in &s.files {
             let code_style = match fc.code.as_str() {
                 "??" => Style::new().blue(),
@@ -475,18 +519,12 @@ fn detail(f: &mut Frame, area: Rect, r: &Repo, tick: usize, scroll: u16) {
                     l.push(format!("-{d}").red());
                 }
             }
-            lines.push(Line::from(l));
+            let selected = sel == Some(items.len());
+            items.push(lines.len());
+            lines.push(item_line(l, selected));
         }
     }
-    render_detail(f, area, lines, scroll);
-}
-
-fn render_detail(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>, scroll: u16) {
-    let p = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0))
-        .block(Block::new().padding(Padding::new(2, 2, 1, 0)));
-    f.render_widget(p, area);
+    (lines, items)
 }
 
 fn diff(f: &mut Frame, area: Rect, title: &str, lines: &[String], scroll: u16) {
@@ -495,7 +533,11 @@ fn diff(f: &mut Frame, area: Rect, title: &str, lines: &[String], scroll: u16) {
     let shown: Vec<Line> = lines[start..(start + height).min(lines.len())]
         .iter()
         .map(|l| {
-            let style = if l.starts_with("+++") || l.starts_with("---") || l.starts_with("diff ") {
+            let style = if l.starts_with("### ") {
+                Style::new().magenta().bold()
+            } else if l.starts_with("commit ") {
+                Style::new().yellow().bold()
+            } else if l.starts_with("+++") || l.starts_with("---") || l.starts_with("diff ") {
                 Style::new().bold()
             } else if l.starts_with('+') {
                 Style::new().green()

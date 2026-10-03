@@ -92,6 +92,20 @@ enum Msg {
     GitDone { path: PathBuf, result: Result<String, String> },
 }
 
+/// What can be selected and opened on the detail page, in display order.
+pub enum Item {
+    Commit(String),
+    File(git::FileChange),
+}
+
+pub fn detail_items(s: &git::Status) -> Vec<Item> {
+    s.unpushed
+        .iter()
+        .map(|c| Item::Commit(c.split(' ').next().unwrap_or_default().to_string()))
+        .chain(s.files.iter().cloned().map(Item::File))
+        .collect()
+}
+
 pub enum Modal {
     Commit { path: PathBuf, message: String, push: bool, generating: bool },
     Confirm { path: PathBuf, title: &'static str, question: String, action: Action },
@@ -105,7 +119,8 @@ pub enum Action {
 
 pub enum View {
     List,
-    Detail { path: PathBuf, scroll: u16 },
+    /// `sel` indexes `detail_items`; `None` means nothing is highlighted yet.
+    Detail { path: PathBuf, scroll: u16, sel: Option<usize> },
     Diff { title: String, lines: Vec<String>, scroll: u16, back: Box<View> },
 }
 
@@ -330,9 +345,12 @@ impl App {
     }
 
     /// Drafts the commit message ahead of time, so it is usually ready (and cached) when `c` is pressed.
+    /// Only for repos whose changes the user already sent to the AI (s, S or --summarize): just opening a repo
+    /// must never send its code anywhere.
     fn prefetch_message(&mut self, i: usize) {
         let r = &self.repos[i];
-        if matches!(&r.status, Some(Ok(s)) if s.dirty()) && self.drafting.insert(r.path.clone()) {
+        let asked = !matches!(r.summary, SummaryState::None);
+        if asked && matches!(&r.status, Some(Ok(s)) if s.dirty()) && self.drafting.insert(r.path.clone()) {
             self.spawn_draft(r.path.clone(), false);
         }
     }
@@ -534,23 +552,50 @@ impl App {
         }
     }
 
+    /// Everything pending in one scrollable view: uncommitted changes, unpushed commits, incoming commits.
     fn open_diff(&mut self, i: usize) {
         let r = &self.repos[i];
         let Some(Ok(s)) = &r.status else { return };
-        let mut text = git::diff(&r.path, s.initial, false);
+        let mut uncommitted = git::diff(&r.path, s.initial, false);
         let untracked: Vec<&str> = s.files.iter().filter(|f| f.code == "??").map(|f| f.path.as_str()).collect();
         if !untracked.is_empty() {
-            text.push_str("\n# Untracked\n");
+            uncommitted.push_str("\n# Untracked\n");
             for u in untracked {
-                text.push_str(&format!("?? {u}\n"));
+                uncommitted.push_str(&format!("?? {u}\n"));
             }
         }
+        let mut text = String::new();
+        if !uncommitted.trim().is_empty() {
+            text.push_str(&format!("### Uncommitted changes ({} files)\n\n{uncommitted}", s.files.len()));
+        }
+        let unpushed = git::unpushed_log(&r.path, s);
+        if !unpushed.is_empty() {
+            text.push_str(&format!("\n### Unpushed commits ({})\n\n{unpushed}", s.unpushed_count));
+        }
+        let incoming = git::incoming_log(&r.path, s);
+        if !incoming.is_empty() {
+            text.push_str(&format!("\n### Incoming commits you are behind on ({}), u pulls them\n\n{incoming}", s.behind));
+        }
         if text.trim().is_empty() {
-            self.notice = Some(format!("{}: no uncommitted changes", r.name));
+            self.notice = Some(format!("{}: nothing pending, no changes and nothing to push or pull (f fetches)", r.name));
             return;
         }
-        let lines = text.lines().take(50_000).map(|l| l.replace('\t', "    ")).collect();
         let title = r.name.clone();
+        self.show_text(title, text);
+    }
+
+    fn open_item(&mut self, i: usize, item: Item) {
+        let r = &self.repos[i];
+        let Some(Ok(s)) = &r.status else { return };
+        let (title, text) = match &item {
+            Item::Commit(hash) => (format!("{} · {hash}", r.name), git::show(&r.path, hash)),
+            Item::File(f) => (format!("{} · {}", r.name, f.path), git::file_diff(&r.path, s.initial, f)),
+        };
+        self.show_text(title, text);
+    }
+
+    fn show_text(&mut self, title: String, text: String) {
+        let lines = text.lines().take(50_000).map(|l| l.replace('\t', "    ")).collect();
         let back = std::mem::replace(&mut self.view, View::List);
         self.view = View::Diff { title, lines, scroll: 0, back: Box::new(back) };
     }
@@ -606,7 +651,7 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.move_sel(1_000_000),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(i) = self.selected_idx() {
-                    self.view = View::Detail { path: self.repos[i].path.clone(), scroll: 0 };
+                    self.view = View::Detail { path: self.repos[i].path.clone(), scroll: 0, sel: None };
                     self.prefetch_message(i);
                 }
             }
@@ -666,25 +711,53 @@ impl App {
     }
 
     fn detail_key(&mut self, k: KeyEvent) -> bool {
-        let View::Detail { path, scroll } = &mut self.view else { return false };
+        let View::Detail { path, .. } = &self.view else { return false };
         let path = path.clone();
-        let mut scroll_by = |d: i32| *scroll = (*scroll as i32 + d).max(0) as u16;
+        let items = match self.repo_idx(&path).map(|i| &self.repos[i].status) {
+            Some(Some(Ok(s))) => detail_items(s),
+            _ => Vec::new(),
+        };
+        let n = items.len();
+        let View::Detail { scroll, sel, .. } = &mut self.view else { return false };
+        // Moves the highlight through commits and files; scrolls instead when there is nothing to select.
+        let mut move_by = |d: isize| {
+            if n == 0 {
+                *scroll = (*scroll as isize + d).max(0) as u16;
+                return;
+            }
+            *sel = match *sel {
+                None if d > 0 => Some((d as usize - 1).min(n - 1)),
+                None => None,
+                Some(x) if (x as isize) + d < 0 => {
+                    *scroll = 0;
+                    None
+                }
+                Some(x) => Some(((x as isize + d) as usize).min(n - 1)),
+            };
+        };
         match k.code {
             KeyCode::Char('q') => return true,
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
                 self.sel_path = Some(path);
                 self.view = View::List;
             }
-            KeyCode::Down | KeyCode::Char('j') => scroll_by(1),
-            KeyCode::Up | KeyCode::Char('k') => scroll_by(-1),
-            KeyCode::PageDown | KeyCode::Char(' ') => scroll_by(15),
-            KeyCode::PageUp => scroll_by(-15),
-            KeyCode::Home | KeyCode::Char('g') => scroll_by(-100_000),
+            KeyCode::Down | KeyCode::Char('j') => move_by(1),
+            KeyCode::Up | KeyCode::Char('k') => move_by(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => move_by(10),
+            KeyCode::PageUp => move_by(-10),
+            KeyCode::Home | KeyCode::Char('g') => move_by(-1_000_000),
+            KeyCode::End | KeyCode::Char('G') => move_by(1_000_000),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let picked = sel.and_then(|s| items.into_iter().nth(s));
+                if let (Some(item), Some(i)) = (picked, self.repo_idx(&path)) {
+                    self.open_item(i, item);
+                }
+            }
             KeyCode::Char('n') | KeyCode::Char('p') => {
                 self.sel_path = Some(path);
                 self.move_sel(if k.code == KeyCode::Char('n') { 1 } else { -1 });
                 if let Some(i) = self.selected_idx() {
-                    self.view = View::Detail { path: self.repos[i].path.clone(), scroll: 0 };
+                    self.view = View::Detail { path: self.repos[i].path.clone(), scroll: 0, sel: None };
                     self.prefetch_message(i);
                 }
             }

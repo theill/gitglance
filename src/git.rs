@@ -293,8 +293,82 @@ pub fn fetch(repo: &Path) -> Result<String, String> {
     git(repo, &["fetch", "--all", "--prune", "--quiet"])
 }
 
-/// Lockfiles and minified output only add noise to an AI summary.
-const NOISE: [&str; 6] = [
+const LOG_PATCH: [&str; 7] =
+    ["log", "--no-color", "--no-ext-diff", "--no-textconv", "--stat", "--patch", "--format=fuller"];
+
+/// Commits on this branch that the remote doesn't have yet, with their patches.
+pub fn unpushed_log(repo: &Path, s: &Status) -> String {
+    if s.unpushed_count == 0 {
+        return String::new();
+    }
+    let mut a = LOG_PATCH.to_vec();
+    if s.tracking {
+        a.push("@{u}..HEAD");
+    } else {
+        a.extend_from_slice(&["HEAD", "--not", "--remotes"]);
+    }
+    git(repo, &a).unwrap_or_default()
+}
+
+/// Commits on the upstream that `u` would pull in.
+pub fn incoming_log(repo: &Path, s: &Status) -> String {
+    if !s.tracking || s.behind == 0 {
+        return String::new();
+    }
+    let mut a = LOG_PATCH.to_vec();
+    a.push("HEAD..@{u}");
+    git(repo, &a).unwrap_or_default()
+}
+
+pub fn show(repo: &Path, hash: &str) -> String {
+    git(repo, &["show", "--no-color", "--no-ext-diff", "--no-textconv", "--stat", "--patch", "--format=fuller", hash])
+        .unwrap_or_else(|e| format!("git show failed: {e}"))
+}
+
+/// The diff of one changed file; for an untracked file, its contents.
+pub fn file_diff(repo: &Path, initial: bool, f: &FileChange) -> String {
+    if f.code == "??" {
+        if f.path.ends_with('/') {
+            let files = git(repo, &["ls-files", "--others", "--exclude-standard", "--", &f.path]).unwrap_or_default();
+            let list: String = files.lines().map(|l| format!("?? {l}\n")).collect();
+            return format!("### New folder {} (untracked)\n\n{list}", f.path);
+        }
+        return match std::fs::read(repo.join(&f.path)) {
+            Ok(b) if b.iter().take(8000).any(|&c| c == 0) => {
+                format!("### New file {} (untracked, binary, {} bytes)", f.path, b.len())
+            }
+            Ok(b) => {
+                let body: String = String::from_utf8_lossy(&b).lines().map(|l| format!("+{l}\n")).collect();
+                format!("### New file {} (untracked)\n\n{body}", f.path)
+            }
+            Err(e) => format!("Could not read {}: {e}", f.path),
+        };
+    }
+    let run = |base: &[&str]| {
+        let mut a = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
+        a.extend_from_slice(base);
+        a.extend_from_slice(&["--", &f.path]);
+        git(repo, &a).unwrap_or_default()
+    };
+    let d = if initial { run(&["--cached"]) + &run(&[]) } else { run(&["HEAD"]) };
+    if d.trim().is_empty() {
+        "No line changes (a mode change, or a submodule)".into()
+    } else {
+        d
+    }
+}
+
+/// Lockfiles and minified output only add noise to an AI summary, and secrets must never be sent at all.
+const NOISE: [&str; 15] = [
+    ":(exclude)*.env",
+    ":(exclude)*.env.*",
+    ":(exclude)*.pem",
+    ":(exclude)*.key",
+    ":(exclude)*.p8",
+    ":(exclude)*.p12",
+    ":(exclude)*id_rsa*",
+    ":(exclude)*id_ed25519*",
+    ":(exclude)*credentials*",
     ":(exclude)*package-lock.json",
     ":(exclude)*.lock",
     ":(exclude)*pnpm-lock.yaml",
@@ -319,6 +393,18 @@ pub fn diff(repo: &Path, initial: bool, skip_noise: bool) -> String {
     } else {
         run(&["HEAD"])
     }
+}
+
+/// Files whose contents must never go into an AI prompt; only their names are listed.
+pub fn looks_secret(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    name == ".env"
+        || name.starts_with(".env.")
+        || name.contains("id_rsa")
+        || name.contains("id_ed25519")
+        || name.contains("credentials")
+        || name.contains("secret")
+        || [".pem", ".key", ".p8", ".p12", ".keystore", ".mobileprovision"].iter().any(|ext| name.ends_with(ext))
 }
 
 pub fn untracked_files(repo: &Path) -> Vec<String> {

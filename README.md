@@ -18,7 +18,7 @@ It uses the `git` CLI (`status --porcelain=v2`, with `--no-optional-locks`), so 
 | `c` | commit everything and push (see below) |
 | `P` | push commits that are already made (asks first) |
 | `u` | pull commits you're behind on (see below) |
-| `d` | full diff |
+| `d` | everything pending: uncommitted diff, unpushed commits with patches, incoming commits |
 | `a` | toggle repos with changes ↔ all repos |
 | `/` | filter by name |
 | `x` | ignore this repo (adds it to `.gitglanceignore`); press again on an ignored repo to un-ignore |
@@ -26,7 +26,7 @@ It uses the `git` CLI (`status --porcelain=v2`, with `--no-optional-locks`), so 
 | `r` / `f` | rescan / `git fetch --all` everywhere, then rescan |
 | `o` | open in Finder |
 
-In the detail view, `n`/`p` jumps to the next or previous repo.
+In the detail view, `↑↓` highlights an unpushed commit or a changed file and `⏎` opens it: a commit as its full `git show`, a file as its diff (or its contents, if it's new). Esc goes back to the same spot. `n`/`p` jumps to the next or previous repo.
 
 Columns: **STATE** `S` staged, `M` modified, `?` untracked, `U` conflicts, `≡` stashes. **SYNC** `↑` ahead, `↓` behind (as of the last fetch), `unpushed` for a branch with no upstream, `local` for no remote.
 
@@ -66,6 +66,8 @@ Ignored repos aren't scanned, so they also make the scan faster.
 ## AI summaries
 
 These run `claude -p` with Haiku and no tools, in a neutral directory. The prompt gets the file list, unpushed commits, the diff (lockfiles left out, capped at 60 KB) and the start of new files. Results are cached in `~/.cache/gitglance`, keyed by that content, so a repo that hasn't changed never costs a second call.
+
+Code only leaves your machine when you ask for it: `s`, `S`, `c` or `--summarize`. Commit messages are drafted in the background only for repos you've already summarized. Secret-looking files (`.env*`, `*.pem`, `*.key`, `*.p8`, `*.p12`, SSH keys, anything named `credentials` or `secret`) are listed by name, but their contents are never sent.
 
 - `GITGLANCE_MODEL=sonnet` picks another model.
 - `GITGLANCE_AI_CMD='llm -m gpt-4o-mini'` uses any command that reads the prompt on stdin.
