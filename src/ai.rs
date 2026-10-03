@@ -15,6 +15,8 @@ No preamble and no closing remarks.";
 const COMMIT_INSTRUCTION: &str = "Write the git commit message for the uncommitted changes below; all of them are committed together (git add -A). Describe only those changes, not the commits listed as not pushed yet. Match the style of the repository's recent commit messages shown under \"Recent commit messages\": the same language, prefixes such as gitmoji or conventional-commit types, casing and length. Keep the subject line to 72 characters at most. Add a blank line and a few short body lines only when the change is too big for the subject alone. Output only the commit message, with no quotes, code fences or commentary.";
 
 const DIFF_BUDGET: usize = 60_000;
+/// A commit subject needs far less of the diff, and a shorter prompt answers faster.
+const COMMIT_DIFF_BUDGET: usize = 20_000;
 const UNTRACKED_BUDGET: usize = 15_000;
 
 fn model() -> String {
@@ -38,6 +40,10 @@ fn clip(s: &str, max: usize) -> &str {
 
 /// Everything the model gets to see. Also the cache key, so an unchanged repo never costs a second call.
 pub fn build_context(repo: &Path, s: &Status) -> String {
+    context_with_budget(repo, s, DIFF_BUDGET)
+}
+
+fn context_with_budget(repo: &Path, s: &Status, diff_budget: usize) -> String {
     let name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut c = String::new();
     let _ = writeln!(c, "Repository: {name}");
@@ -82,8 +88,8 @@ pub fn build_context(repo: &Path, s: &Status) -> String {
         let d = git::diff(repo, s.initial, true);
         if !d.is_empty() {
             let _ = writeln!(c, "\nDiff of tracked files (lockfiles omitted):");
-            c.push_str(clip(&d, DIFF_BUDGET));
-            if d.len() > DIFF_BUDGET {
+            c.push_str(clip(&d, diff_budget));
+            if d.len() > diff_budget {
                 c.push_str("\n[diff truncated]\n");
             }
         }
@@ -144,7 +150,7 @@ pub fn summarize(context: &str, force: bool) -> Result<String, String> {
 }
 
 pub fn commit_message(repo: &Path, s: &Status, force: bool) -> Result<String, String> {
-    let mut context = build_context(repo, s);
+    let mut context = context_with_budget(repo, s, COMMIT_DIFF_BUDGET);
     let recent = git::git(repo, &["log", "-12", "--format=%s"]).unwrap_or_default();
     if !recent.trim().is_empty() {
         context.push_str("\nRecent commit messages:\n");
@@ -179,7 +185,14 @@ fn ask(instruction: &str, context: &str, force: bool) -> Result<String, String> 
                 "",
                 "--strict-mcp-config",
                 "--no-session-persistence",
+                // Skipping user settings (plugins, hooks) saves over a second of startup per call.
+                "--setting-sources",
+                "",
+                // Extended thinking is on by default and made a one-line answer take ~12s instead of ~2s.
+                "--settings",
+                r#"{"alwaysThinkingEnabled":false}"#,
             ]);
+            k.env("MAX_THINKING_TOKENS", "0");
             (k, context.to_string())
         }
     };

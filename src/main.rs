@@ -5,7 +5,7 @@ mod ui;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -125,6 +125,8 @@ pub struct App {
     pub table_state: TableState,
     pub view: View,
     pub modal: Option<Modal>,
+    /// Repos with a commit message being drafted right now.
+    drafting: HashSet<PathBuf>,
     pub tick: usize,
     pub notice: Option<String>,
     tx: mpsc::Sender<Msg>,
@@ -171,6 +173,7 @@ impl App {
             table_state: TableState::default(),
             view: View::List,
             modal: None,
+            drafting: HashSet::new(),
             tick: 0,
             notice: None,
             tx,
@@ -317,7 +320,25 @@ impl App {
     fn generate_message(&mut self, force: bool) {
         let Some(Modal::Commit { path, generating, .. }) = &mut self.modal else { return };
         *generating = true;
-        let (path, tx) = (path.clone(), self.tx.clone());
+        let path = path.clone();
+        // A draft started in the background is already on its way and will fill the box.
+        if !force && self.drafting.contains(&path) {
+            return;
+        }
+        self.drafting.insert(path.clone());
+        self.spawn_draft(path, force);
+    }
+
+    /// Drafts the commit message ahead of time, so it is usually ready (and cached) when `c` is pressed.
+    fn prefetch_message(&mut self, i: usize) {
+        let r = &self.repos[i];
+        if matches!(&r.status, Some(Ok(s)) if s.dirty()) && self.drafting.insert(r.path.clone()) {
+            self.spawn_draft(r.path.clone(), false);
+        }
+    }
+
+    fn spawn_draft(&self, path: PathBuf, force: bool) {
+        let tx = self.tx.clone();
         thread::spawn(move || {
             let result = git::status(&path).and_then(|s| ai::commit_message(&path, &s, force));
             let _ = tx.send(Msg::CommitMessage { path, result });
@@ -481,6 +502,7 @@ impl App {
                 }
             }
             Msg::CommitMessage { path, result } => {
+                self.drafting.remove(&path);
                 let Some(Modal::Commit { path: open, message, generating, .. }) = &mut self.modal else { return };
                 if *open != path {
                     return;
@@ -585,11 +607,13 @@ impl App {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(i) = self.selected_idx() {
                     self.view = View::Detail { path: self.repos[i].path.clone(), scroll: 0 };
+                    self.prefetch_message(i);
                 }
             }
             KeyCode::Char('s') => {
                 if let Some(i) = self.selected_idx() {
                     self.summarize(i, true);
+                    self.prefetch_message(i);
                 }
             }
             KeyCode::Char('S') => self.summarize_all(),
@@ -661,6 +685,7 @@ impl App {
                 self.move_sel(if k.code == KeyCode::Char('n') { 1 } else { -1 });
                 if let Some(i) = self.selected_idx() {
                     self.view = View::Detail { path: self.repos[i].path.clone(), scroll: 0 };
+                    self.prefetch_message(i);
                 }
             }
             KeyCode::Char('s') => {
