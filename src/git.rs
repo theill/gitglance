@@ -64,7 +64,9 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn run(repo: &Path, args: &[&str], input: Option<&str>) -> Result<String, String> {
+    // A repo's own config could otherwise make a passive scan run programs (fsmonitor hook, textconv filters).
     let mut child = Command::new("git")
+        .args(["-c", "core.fsmonitor=false"])
         .arg("--no-optional-locks")
         .arg("-C")
         .arg(repo)
@@ -275,7 +277,7 @@ const NOISE: [&str; 6] = [
 /// Staged and unstaged changes to tracked files.
 pub fn diff(repo: &Path, initial: bool, skip_noise: bool) -> String {
     let run = |base: &[&str]| {
-        let mut a: Vec<&str> = vec!["diff", "--no-color", "--no-ext-diff"];
+        let mut a: Vec<&str> = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
         a.extend_from_slice(base);
         if skip_noise {
             a.extend_from_slice(&["--", "."]);
