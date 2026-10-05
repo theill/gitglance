@@ -52,14 +52,26 @@ fn modal(f: &mut Frame, area: Rect, app: &App) {
     let width = area.width.saturating_sub(4).min(96);
     let inner_w = width.saturating_sub(4).max(1) as usize;
     let (title, lines) = match m {
-        Modal::Commit { path, message, push, generating } => {
+        Modal::Commit { path, message, push, generating, held_back, secret_tracked } => {
             let Some(r) = app.repo_idx(path).map(|i| &app.repos[i]) else { return };
             let mut lines = Vec::new();
             if let Some(Ok(s)) = &r.status {
                 lines.push(Line::from(vec![r.name.clone().yellow().bold(), "  on ".dark_gray(), s.branch.clone().bold()]));
-                let mut what = vec![format!("Stages and commits all {} files  ", s.files.len()).dark_gray()];
+                let kept = s.files.iter().filter(|f| !held_back.contains(&f.path)).count();
+                let all = if kept == s.files.len() { "all " } else { "" };
+                let mut what = vec![format!("Stages and commits {all}{kept} files  ").dark_gray()];
                 what.extend(state_spans(s));
                 lines.push(Line::from(what));
+            }
+            if !held_back.is_empty() {
+                lines.push(Line::from(
+                    format!("Leaving out secret-looking new files (add them to .gitignore): {}", held_back.join(", ")).yellow(),
+                ));
+            }
+            if !secret_tracked.is_empty() {
+                lines.push(Line::from(
+                    format!("⚠ Includes changes to tracked secret-looking files: {}", secret_tracked.join(", ")).red().bold(),
+                ));
             }
             lines.push(Line::raw(""));
             if message.is_empty() && *generating {

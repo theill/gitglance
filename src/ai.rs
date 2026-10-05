@@ -6,13 +6,13 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const SUMMARY_INSTRUCTION: &str = "You summarize the pending work in a local git repository (uncommitted changes and commits not yet pushed) for a developer who juggles 10-15 projects at once and needs to recall quickly where each one stands. Reply in plain text, with no markdown headings or bold.
+const SUMMARY_INSTRUCTION: &str = "Everything you need is in the text below: you cannot run commands or open files, so never say you will look something up, and work only from what is given. You summarize the pending work in a local git repository (uncommitted changes, commits not yet pushed, and commits on the remote not yet pulled) for a developer who juggles 10-15 projects at once and needs to recall quickly where each one stands. Reply in plain text, with no markdown headings or bold.
 Line 1: a headline of at most 70 characters that captures the gist of the work in progress.
 Then a blank line, then 2-5 bullets starting with \"- \", one short line each, describing what changed, grouped by intent rather than by file.
 Finally, only if relevant, one line starting with \"Heads-up: \" that flags anything risky: merge conflicts, secrets or credentials, debug leftovers, large generated or binary files, work that looks half-done, or a branch that has never been pushed.
 No preamble and no closing remarks.";
 
-const COMMIT_INSTRUCTION: &str = "Write the git commit message for the uncommitted changes below; all of them are committed together (git add -A). Describe only those changes, not the commits listed as not pushed yet. Match the style of the repository's recent commit messages shown under \"Recent commit messages\": the same language, prefixes such as gitmoji or conventional-commit types, casing and length. Keep the subject line to 72 characters at most. Add a blank line and a few short body lines only when the change is too big for the subject alone. Output only the commit message, with no quotes, code fences or commentary.";
+const COMMIT_INSTRUCTION: &str = "Everything you need is in the text below: you cannot run commands or open files. Write the git commit message for the uncommitted changes below; all of them are committed together (git add -A). Describe only those changes, not the commits listed as not pushed yet. Match the style of the repository's recent commit messages shown under \"Recent commit messages\": the same language, prefixes such as gitmoji or conventional-commit types, casing and length. Keep the subject line to 72 characters at most. Add a blank line and a few short body lines only when the change is too big for the subject alone. Output only the commit message, with no quotes, code fences or commentary.";
 
 const DIFF_BUDGET: usize = 60_000;
 /// A commit subject needs far less of the diff, and a shorter prompt answers faster.
@@ -84,8 +84,16 @@ fn context_with_budget(repo: &Path, s: &Status, diff_budget: usize) -> String {
         }
     }
 
+    if s.tracking && s.behind > 0 {
+        let _ = writeln!(c, "\nCommits on the remote that have not been pulled yet ({}):", s.behind);
+        c.push_str(&git::git(repo, &["log", "--format=%h %s", "-n", "30", "HEAD..@{u}"]).unwrap_or_default());
+    }
+
     if s.staged + s.unstaged + s.conflicts > 0 {
-        let d = git::diff(repo, s.initial, true);
+        let (d, secret) = git::without_secret_files(&git::diff(repo, s.initial, true));
+        if secret > 0 {
+            let _ = writeln!(c, "\n(The diff of {secret} secret-looking file(s) was left out on purpose.)");
+        }
         if !d.is_empty() {
             let _ = writeln!(c, "\nDiff of tracked files (lockfiles omitted):");
             c.push_str(clip(&d, diff_budget));
@@ -245,8 +253,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sh = |cmd: &str| assert!(Command::new("sh").arg("-c").arg(cmd).current_dir(&dir).status().unwrap().success());
         sh("git init -q && git config user.email t@t && git config user.name t");
-        sh("echo A=1 > .env && echo code > app.txt && git add -A && git commit -qm init");
+        sh("echo A=1 > .env && echo A=1 > .ENV.prod && echo k > release.keystore && echo s > secrets.json && echo o > old.txt");
+        sh("echo code > app.txt && git add -A && git commit -qm init");
         sh("echo A=SUPERSECRET1 > .env && echo more >> app.txt");
+        // Tracked files the old pathspec excludes missed: other extensions, upper case, and a rename.
+        sh("echo SUPERSECRET4 > release.keystore && echo SUPERSECRET5 > secrets.json && echo SUPERSECRET6 > .ENV.prod");
+        sh("echo SUPERSECRET7 >> old.txt && git mv old.txt prod.pem");
         sh("echo SUPERSECRET2 > AuthKey_X.p8 && echo SUPERSECRET3 > .env.local && echo hello > notes.md");
 
         let s = git::status(&dir).unwrap();

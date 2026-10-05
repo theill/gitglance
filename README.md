@@ -21,7 +21,7 @@ It uses the `git` CLI (`status --porcelain=v2`, with `--no-optional-locks`), so 
 | `d` | everything pending: uncommitted diff, unpushed commits with patches, incoming commits |
 | `a` | toggle repos with changes ↔ all repos |
 | `/` | filter by name |
-| `x` | ignore this repo (adds it to `.gitglanceignore`); press again on an ignored repo to un-ignore |
+| `x` | ignore this repo (adds it to `.gitglanceignore`); press `x` on an ignored repo to un-ignore it |
 | `I` | show or hide ignored repos |
 | `r` / `f` | rescan / `git fetch --all` everywhere, then rescan |
 | `o` | open in Finder |
@@ -35,6 +35,7 @@ Columns: **STATE** `S` staged, `M` modified, `?` untracked, `U` conflicts, `≡`
 `c` opens a commit box for the selected repo. Claude drafts the message from the diff, matching the style of the repo's last 12 commits (gitmoji, language, casing). You can type over the draft, start typing before it arrives (the draft won't overwrite you), or press ctrl+g for a new one.
 
 - `⏎` runs `git add -A` (`.gitignore` still applies), commits and pushes. Hooks run as normal.
+- New secret-looking files that aren't gitignored (`.env*`, keys, `*.p8`, anything named `credentials` or `secret`) are left out of the commit, and the box lists them. If a file like that is *already tracked*, the box shows a red warning, because its changes would be committed.
 - `tab` turns the push off and on.
 - `alt+⏎` adds a newline.
 - A branch with no upstream is pushed to `origin` with `--set-upstream`. A repo with no remote is only committed.
@@ -50,16 +51,16 @@ Columns: **STATE** `S` staged, `M` modified, `?` untracked, `U` conflicts, `≡`
 
 Uncommitted changes are stashed for the pull and restored afterwards.
 
-## Ignoring folders
+## Ignoring repos
 
-Ignored folders are listed in `.gitglanceignore` in the scanned folder (e.g. `~/code/.gitglanceignore`), one per line, gitignore style. `x` writes to it for you, and you can also edit it by hand (press `r` to reload):
+Ignored repos are listed in `.gitglanceignore` in the scanned folder (e.g. `~/code/.gitglanceignore`), one per line, as their path relative to that folder. `x` writes to it for you, and you can also edit it by hand (press `r` to reload):
 
 ```
-apikiss          # a name without / matches that folder at any depth
-*-site           # globs: * and ?
-unops            # ignoring a folder ignores every repo below it
-unops/*          # a path with / is relative to the scanned folder
+apikiss
+unops/opportunityplus   # comments are fine
 ```
+
+A line hides exactly that repo. It never hides repos nested below it, or another repo with the same name in a different folder, and there are no globs. New repos always show up until you choose to ignore them.
 
 Ignored repos aren't scanned, so they also make the scan faster.
 

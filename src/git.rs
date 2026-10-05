@@ -95,11 +95,21 @@ fn run(repo: &Path, args: &[&str], input: Option<&str>) -> Result<String, String
     }
 }
 
-/// Stages everything (`.gitignore` still applies) and commits. Returns the short hash.
-pub fn commit_all(repo: &Path, message: &str) -> Result<String, String> {
-    git(repo, &["add", "-A"])?;
+/// New files that `commit_all` leaves out because they look like secrets (a `.env` or key that is not gitignored).
+pub fn secret_new_files(repo: &Path) -> Vec<String> {
+    untracked_files(repo).into_iter().filter(|f| looks_secret(f)).collect()
+}
+
+/// Stages everything except new secret-looking files (`.gitignore` still applies) and commits.
+/// Returns the short hash and the files that were held back.
+pub fn commit_all(repo: &Path, message: &str) -> Result<(String, Vec<String>), String> {
+    let held_back = secret_new_files(repo);
+    let excludes: Vec<String> = held_back.iter().map(|f| format!(":(exclude,literal){f}")).collect();
+    let mut args = vec!["add", "-A", "--", "."];
+    args.extend(excludes.iter().map(String::as_str));
+    git(repo, &args)?;
     run(repo, &["commit", "--quiet", "--file=-"], Some(message))?;
-    Ok(git(repo, &["rev-parse", "--short", "HEAD"])?.trim().to_string())
+    Ok((git(repo, &["rev-parse", "--short", "HEAD"])?.trim().to_string(), held_back))
 }
 
 /// Brings in commits from the upstream. Fast-forward only, or a rebase of local commits when the branch has
@@ -358,17 +368,9 @@ pub fn file_diff(repo: &Path, initial: bool, f: &FileChange) -> String {
     }
 }
 
-/// Lockfiles and minified output only add noise to an AI summary, and secrets must never be sent at all.
-const NOISE: [&str; 15] = [
-    ":(exclude)*.env",
-    ":(exclude)*.env.*",
-    ":(exclude)*.pem",
-    ":(exclude)*.key",
-    ":(exclude)*.p8",
-    ":(exclude)*.p12",
-    ":(exclude)*id_rsa*",
-    ":(exclude)*id_ed25519*",
-    ":(exclude)*credentials*",
+/// Lockfiles and minified output only add noise to an AI summary. Secrets are not handled here but by
+/// `without_secret_files`, so one rule (`looks_secret`) decides for tracked and untracked files alike.
+const NOISE: [&str; 6] = [
     ":(exclude)*package-lock.json",
     ":(exclude)*.lock",
     ":(exclude)*pnpm-lock.yaml",
@@ -393,6 +395,35 @@ pub fn diff(repo: &Path, initial: bool, skip_noise: bool) -> String {
     } else {
         run(&["HEAD"])
     }
+}
+
+/// Drops every file section of a unified diff whose old or new path looks secret, so renames and
+/// mixed-case names are caught too. Returns the filtered diff and how many files were dropped.
+pub fn without_secret_files(diff: &str) -> (String, usize) {
+    let mut out = String::with_capacity(diff.len());
+    let (mut skipping, mut dropped) = (false, 0);
+    for line in diff.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            skipping = diff_paths(rest.trim_end()).iter().any(|p| looks_secret(p));
+            dropped += skipping as usize;
+        }
+        if !skipping {
+            out.push_str(line);
+        }
+    }
+    (out, dropped)
+}
+
+/// Both paths from the rest of a `diff --git a/<old> b/<new>` header. Ambiguous splits (paths containing
+/// " b/") yield every candidate, so a secret can't hide behind an odd name.
+fn diff_paths(rest: &str) -> Vec<String> {
+    let rest = rest.replace('"', "");
+    let mut paths = vec![rest.clone()];
+    for (i, _) in rest.match_indices(" b/") {
+        paths.push(rest[..i].trim_start_matches("a/").to_string());
+        paths.push(rest[i + 3..].to_string());
+    }
+    paths
 }
 
 /// Files whose contents must never go into an AI prompt; only their names are listed.

@@ -22,9 +22,9 @@ USAGE:
     -s, --summarize
                    ask the AI for a summary of every repo with changes on start
 
-Press x on a repo to ignore it. Ignored folders are listed in DIR/.gitglanceignore,
-one per line, gitignore style: a name without / matches a folder at any depth
-(`archive`, `*-site`), a path with / is relative to DIR (`unops/*`).
+Press x on a repo to ignore it. Ignored repos are listed in DIR/.gitglanceignore, one
+per line as their path relative to DIR (`unops/opportunityplus`). A line hides exactly
+that repo, never repos nested below it.
 
 Press c to commit everything in a repo (Claude drafts the message) and push,
 P to push commits that are already made, or u to pull in commits you are behind on.
@@ -107,7 +107,16 @@ pub fn detail_items(s: &git::Status) -> Vec<Item> {
 }
 
 pub enum Modal {
-    Commit { path: PathBuf, message: String, push: bool, generating: bool },
+    Commit {
+        path: PathBuf,
+        message: String,
+        push: bool,
+        generating: bool,
+        /// New secret-looking files the commit will leave out.
+        held_back: Vec<String>,
+        /// Tracked secret-looking files whose changes the commit will include.
+        secret_tracked: Vec<String>,
+    },
     Confirm { path: PathBuf, title: &'static str, question: String, action: Action },
 }
 
@@ -303,6 +312,10 @@ impl App {
         } else {
             self.ignore.add(&rel).map(|_| format!("Ignored {rel}  ·  I shows ignored repos, x again to undo"))
         };
+        self.finish_ignore(result);
+    }
+
+    fn finish_ignore(&mut self, result: std::io::Result<String>) {
         self.notice = Some(match result {
             Ok(msg) => msg,
             Err(e) => format!("Could not write {}: {e}", ignore::FILE_NAME),
@@ -328,7 +341,17 @@ impl App {
             return;
         }
         let push = s.has_remote && s.branch != "(detached)";
-        self.modal = Some(Modal::Commit { path: r.path.clone(), message: String::new(), push, generating: false });
+        let held_back = git::secret_new_files(&r.path);
+        let secret_tracked =
+            s.files.iter().filter(|f| f.code != "??" && git::looks_secret(&f.path)).map(|f| f.path.clone()).collect();
+        self.modal = Some(Modal::Commit {
+            path: r.path.clone(),
+            message: String::new(),
+            push,
+            generating: false,
+            held_back,
+            secret_tracked,
+        });
         self.generate_message(false);
     }
 
@@ -374,13 +397,17 @@ impl App {
         self.modal = None;
         self.start_op(path, move |p| {
             let s = git::status(p)?;
-            let hash = git::commit_all(p, &message)?;
+            let (hash, held_back) = git::commit_all(p, &message)?;
+            let note = match held_back.len() {
+                0 => String::new(),
+                n => format!(" (left out {n} secret-looking new file{}: {})", if n == 1 { "" } else { "s" }, held_back.join(", ")),
+            };
             if !push {
-                return Ok(format!("committed {hash}"));
+                return Ok(format!("committed {hash}{note}"));
             }
             match git::push(p, &s) {
-                Ok(pushed) => Ok(format!("committed {hash} and {pushed}")),
-                Err(e) => Err(format!("committed {hash}, but the push failed: {e}")),
+                Ok(pushed) => Ok(format!("committed {hash} and {pushed}{note}")),
+                Err(e) => Err(format!("committed {hash}{note}, but the push failed: {e}")),
             }
         });
     }
@@ -699,7 +726,7 @@ impl App {
                 self.show_ignored = !self.show_ignored;
                 let n = self.repos.iter().filter(|r| r.ignored).count();
                 self.notice = Some(match (self.show_ignored, n) {
-                    (true, 0) => format!("Nothing ignored yet. Press x on a repo, or list folders in {}", ignore::FILE_NAME),
+                    (true, 0) => format!("Nothing ignored yet. Press x on a repo, or list repos in {}", ignore::FILE_NAME),
                     (true, _) => format!("Showing {n} ignored repos at the bottom. x un-ignores"),
                     (false, _) => "Hiding ignored repos".into(),
                 });
