@@ -8,6 +8,31 @@ cd ~/code && gitglance          # or: gitglance ~/code --depth 2 --summarize
 
 It uses the `git` CLI (`status --porcelain=v2`, with `--no-optional-locks`), so `.gitignore`, global excludes and your git config are respected, and it never competes for the index lock with agents that commit in the background. Repos are scanned in parallel.
 
+## Install
+
+You need [Rust](https://rustup.rs) (via `rustup`) and `git`. The repo pins its Rust version in `rust-toolchain.toml`, and rustup fetches that version automatically on the first build.
+
+```bash
+# 1. Install Rust, if you don't have it
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# 2. Install gitglance straight from GitHub
+cargo install --git https://github.com/theill/gitglance
+```
+
+This puts the `gitglance` binary in `~/.cargo/bin`. Make sure that folder is on your `PATH`; the rustup installer normally sets this up, but you may need to open a new terminal first.
+
+From a local checkout:
+
+```bash
+git clone https://github.com/theill/gitglance && cd gitglance
+cargo install --path .
+```
+
+Run the same command again to update. `cargo uninstall gitglance` removes it.
+
+AI summaries and drafted commit messages are optional. They need the [Claude Code](https://claude.com/claude-code) CLI (`claude`) on your `PATH`, or another command set through `GITGLANCE_AI_CMD` (see [AI summaries](#ai-summaries)). Everything else works without it.
+
 ## Keys
 
 | List | |
@@ -72,11 +97,5 @@ Code only leaves your machine when you ask for it: `s`, `S`, `c` or `--summarize
 
 - `GITGLANCE_MODEL=sonnet` picks another model.
 - `GITGLANCE_AI_CMD='llm -m gpt-4o-mini'` uses any command that reads the prompt on stdin.
-
-## Build
-
-```bash
-cargo install --path .
-```
 
 `rust-toolchain.toml` pins 1.98.1, because the machine's `stable` toolchain is an old 1.77.
