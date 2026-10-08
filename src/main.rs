@@ -627,8 +627,16 @@ impl App {
         self.view = View::Diff { title, lines, scroll: 0, back: Box::new(back) };
     }
 
-    fn open_in_finder(&mut self, i: usize) {
-        let _ = std::process::Command::new("open").arg(&self.repos[i].path).spawn();
+    /// Opens the repo folder in the file manager (Finder on macOS, the default one via xdg-open elsewhere).
+    fn open_in_file_manager(&mut self, i: usize) {
+        use std::process::{Command, Stdio};
+        let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let _ = Command::new(cmd)
+            .arg(&self.repos[i].path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
 
     /// Returns true when the app should quit.
@@ -711,7 +719,7 @@ impl App {
             }
             KeyCode::Char('o') => {
                 if let Some(i) = self.selected_idx() {
-                    self.open_in_finder(i);
+                    self.open_in_file_manager(i);
                 }
             }
             KeyCode::Char('r') => self.rescan(false),
@@ -815,7 +823,7 @@ impl App {
             }
             KeyCode::Char('o') => {
                 if let Some(i) = self.repo_idx(&path) {
-                    self.open_in_finder(i);
+                    self.open_in_file_manager(i);
                 }
             }
             KeyCode::Char('r') => self.rescan(false),

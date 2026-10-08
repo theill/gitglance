@@ -49,7 +49,7 @@ AI summaries and drafted commit messages are optional. They need the [Claude Cod
 | `x` | ignore this repo (adds it to `.gitglanceignore`); press `x` on an ignored repo to un-ignore it |
 | `I` | show or hide ignored repos |
 | `r` / `f` | rescan / `git fetch --all` everywhere, then rescan |
-| `o` | open in Finder |
+| `o` | open the repo folder in your file manager (Finder on macOS, `xdg-open` on Linux) |
 
 In the detail view, `↑↓` highlights an unpushed commit or a changed file and `⏎` opens it: a commit as its full `git show`, a file as its diff (or its contents, if it's new). Esc goes back to the same spot. `n`/`p` jumps to the next or previous repo.
 

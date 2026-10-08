@@ -203,7 +203,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("P", "push"),
             ("u", "pull"),
             ("d", "diff"),
-            ("o", "finder"),
+            ("o", "open folder"),
             ("r", "refresh"),
             ("q", "quit"),
         ],
