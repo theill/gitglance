@@ -446,3 +446,167 @@ pub fn untracked_files(repo: &Path) -> Vec<String> {
         .map(String::from)
         .collect()
 }
+
+/// How many days and weeks the activity graphs cover.
+pub const DAYS: usize = 42;
+pub const WEEKS: usize = 24;
+
+#[derive(Clone, Default)]
+pub struct Author {
+    pub name: String,
+    pub commits: u32,
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// Commit activity across all branches (merges left out), for the detail page.
+#[derive(Clone, Default)]
+pub struct Activity {
+    pub total_commits: u32,
+    pub first_commit_ts: Option<i64>,
+    /// Today as days since 1970-01-01, in local time.
+    pub today: i64,
+    /// Commits per day, oldest first; the last one is today.
+    pub days: Vec<u32>,
+    /// Commits per week (weeks start on Monday), oldest first; the last one is this week.
+    pub weeks: Vec<u32>,
+    /// Authors over the `WEEKS` window, most commits first.
+    pub authors: Vec<Author>,
+}
+
+pub fn activity(repo: &Path) -> Result<Activity, String> {
+    let today = local_today();
+    let this_monday = today - weekday(today);
+    let first_day = this_monday - 7 * (WEEKS as i64 - 1);
+    let since = format!("--since={}.days.ago", today - first_day + 1);
+    let log = git(
+        repo,
+        &[
+            "log",
+            "--exclude=refs/stash",
+            "--all",
+            "--no-merges",
+            &since,
+            "--date=format-local:%Y-%m-%d",
+            "--format=%x01%ad%x09%aN",
+            "--shortstat",
+        ],
+    )?;
+    let mut a = Activity { today, days: vec![0; DAYS], weeks: vec![0; WEEKS], ..Default::default() };
+    let mut authors: Vec<Author> = Vec::new();
+    let mut current: Option<usize> = None;
+    for line in log.lines() {
+        if let Some(rest) = line.strip_prefix('\u{1}') {
+            current = None;
+            let Some((date, name)) = rest.split_once('\t') else { continue };
+            let Some(day) = parse_day(date) else { continue };
+            if day < first_day || day > today {
+                continue;
+            }
+            let back = (today - day) as usize;
+            if back < DAYS {
+                a.days[DAYS - 1 - back] += 1;
+            }
+            let weeks_back = ((this_monday - (day - weekday(day))) / 7) as usize;
+            if weeks_back < WEEKS {
+                a.weeks[WEEKS - 1 - weeks_back] += 1;
+            }
+            let i = match authors.iter().position(|x| x.name == name) {
+                Some(i) => i,
+                None => {
+                    authors.push(Author { name: name.to_string(), ..Default::default() });
+                    authors.len() - 1
+                }
+            };
+            authors[i].commits += 1;
+            current = Some(i);
+        } else if let (Some(i), true) = (current, line.contains("changed")) {
+            // " 3 files changed, 10 insertions(+), 2 deletions(-)"
+            for part in line.split(',') {
+                let n: u32 = part.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                if part.contains("insertion") {
+                    authors[i].added += n;
+                } else if part.contains("deletion") {
+                    authors[i].removed += n;
+                }
+            }
+        }
+    }
+    authors.sort_by(|x, y| y.commits.cmp(&x.commits).then_with(|| x.name.cmp(&y.name)));
+    a.authors = authors;
+    a.total_commits = git(repo, &["rev-list", "--count", "--no-merges", "--exclude=refs/stash", "--all"])
+        .ok()
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0);
+    a.first_commit_ts = git(repo, &["log", "--exclude=refs/stash", "--all", "--max-parents=0", "--format=%ct"])
+        .ok()
+        .and_then(|out| out.lines().filter_map(|l| l.trim().parse().ok()).min());
+    Ok(a)
+}
+
+/// Today's local date as days since 1970-01-01, from `date`; UTC if that isn't available.
+fn local_today() -> i64 {
+    Command::new("date")
+        .arg("+%Y-%m-%d")
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| parse_day(String::from_utf8_lossy(&o.stdout).trim()))
+        .unwrap_or_else(|| {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            secs.div_euclid(86_400)
+        })
+}
+
+fn parse_day(s: &str) -> Option<i64> {
+    let mut p = s.splitn(3, '-').map(|n| n.parse::<i64>().ok());
+    Some(days_from_civil(p.next()??, p.next()??, p.next()??))
+}
+
+/// Monday is 0. 1970-01-01 was a Thursday.
+pub fn weekday(day: i64) -> i64 {
+    (day + 3).rem_euclid(7)
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The (year, month, day) for days since 1970-01-01.
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_round_trip() {
+        for day in [-1, 0, 59, 365, 11_016, 20_734, 20_735] {
+            let (y, m, d) = civil_from_days(day);
+            assert_eq!(days_from_civil(y, m as i64, d as i64), day);
+        }
+        assert_eq!(parse_day("1970-01-01"), Some(0));
+        assert_eq!(civil_from_days(parse_day("2026-10-08").unwrap()), (2026, 10, 8));
+        assert_eq!(weekday(parse_day("2026-10-05").unwrap()), 0); // a Monday
+        assert_eq!(weekday(parse_day("2026-10-11").unwrap()), 6);
+    }
+}

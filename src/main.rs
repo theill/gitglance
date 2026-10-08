@@ -22,6 +22,9 @@ USAGE:
     -d, --depth N  how deep to look for repos below DIR (default: 2)
     -s, --summarize
                    ask the AI for a summary of every repo with changes on start
+    --no-auto-summary
+                   don't summarize a repo's changes on your behalf when you open it
+                   (by default, opening a repo with changes for half a second does)
     -i, --interval SECS
                    re-check every repo this often, so changes made in other sessions show
                    up on their own (default: 5, 0 starts paused; w toggles it)
@@ -64,6 +67,8 @@ pub struct Repo {
     gen: u64,
     /// When a re-check last found something different, so the list can mark what moved.
     pub changed_at: Option<Instant>,
+    /// Commit activity for the detail page, loaded when the repo is opened.
+    pub activity: Option<Result<git::Activity, String>>,
     pub ignored: bool,
 }
 
@@ -86,6 +91,7 @@ impl Repo {
             checking: false,
             gen: 0,
             changed_at: None,
+            activity: None,
             ignored: false,
         }
     }
@@ -114,6 +120,7 @@ enum Msg {
     Summarized { path: PathBuf, result: Result<String, String> },
     CommitMessage { path: PathBuf, result: Result<String, String> },
     GitDone { path: PathBuf, result: Result<String, String> },
+    Activity { path: PathBuf, result: Result<git::Activity, String> },
 }
 
 /// What can be selected and opened on the detail page, in display order.
@@ -185,13 +192,24 @@ pub struct App {
     pub last_fetch: Option<Instant>,
     /// A repo to open a shell in; the run loop does it, since it owns the terminal.
     shell: Option<PathBuf>,
+    /// Summarize a repo's changes once it has been open on the detail page for `LINGER`.
+    auto_summary: bool,
+    /// The repo whose detail page was just opened, and when; cleared once the linger check ran.
+    opened: Option<(PathBuf, Instant)>,
     tx: mpsc::Sender<Msg>,
     rx: mpsc::Receiver<Msg>,
     ai_tx: mpsc::Sender<(PathBuf, String, bool)>,
 }
 
 impl App {
-    fn new(root: PathBuf, depth: usize, auto: bool, interval: Duration, fetch_every: Option<Duration>) -> Self {
+    fn new(
+        root: PathBuf,
+        depth: usize,
+        auto: bool,
+        auto_summary: bool,
+        interval: Duration,
+        fetch_every: Option<Duration>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let (ai_tx, ai_rx) = mpsc::channel::<(PathBuf, String, bool)>();
         let ai_rx = Arc::new(Mutex::new(ai_rx));
@@ -238,6 +256,8 @@ impl App {
             last_check: Instant::now(),
             last_fetch: None,
             shell: None,
+            auto_summary,
+            opened: None,
             tx,
             rx,
             ai_tx,
@@ -385,6 +405,41 @@ impl App {
         }
         if !back.is_empty() {
             self.spawn_scan(back, false, false);
+        }
+    }
+
+    fn open_detail(&mut self, i: usize) {
+        let path = self.repos[i].path.clone();
+        self.view = View::Detail { path: path.clone(), scroll: 0, sel: None };
+        self.prefetch_message(i);
+        self.load_activity(path.clone());
+        self.opened = Some((path, Instant::now()));
+    }
+
+    fn load_activity(&self, path: PathBuf) {
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = git::activity(&path);
+            let _ = tx.send(Msg::Activity { path, result });
+        });
+    }
+
+    /// Opening a repo with changes asks for a summary, but only once it has stayed open for `LINGER`, so paging
+    /// through repos with n/p or opening one by mistake sends nothing.
+    fn summarize_if_lingering(&mut self) {
+        const LINGER: Duration = Duration::from_millis(500);
+        let Some((path, since)) = &self.opened else { return };
+        if since.elapsed() < LINGER {
+            return;
+        }
+        let path = path.clone();
+        self.opened = None;
+        let still_open = matches!(&self.view, View::Detail { path: p, .. } if *p == path);
+        let Some(i) = self.repo_idx(&path) else { return };
+        let r = &self.repos[i];
+        if self.auto_summary && still_open && r.context.is_some() && matches!(r.summary, SummaryState::None) {
+            self.summarize(i, false);
+            self.prefetch_message(i);
         }
     }
 
@@ -624,9 +679,14 @@ impl App {
                 let status = *status;
                 r.busy = false;
                 r.checking = false;
+                let new_commits = matches!((&r.status, &status), (Some(Ok(old)), Ok(new)) if old.last_commit_ts != new.last_commit_ts || old.ahead != new.ahead || old.behind != new.behind);
                 if matches!((&r.status, &status), (Some(Ok(old)), Ok(new)) if old != new) {
                     r.changed_at = Some(Instant::now());
                 }
+                if new_commits && matches!(&self.view, View::Detail { path: p, .. } if *p == path) {
+                    self.load_activity(path.clone());
+                }
+                let r = &mut self.repos[i];
                 r.status = Some(status);
                 // A re-check that finds the same changes keeps the summary as it is (a failure message, too).
                 if !quiet || r.context != context {
@@ -663,6 +723,11 @@ impl App {
                     Err(e) => format!("{name}: {e}"),
                 });
                 self.spawn_scan(vec![path], false, false);
+            }
+            Msg::Activity { path, result } => {
+                if let Some(i) = self.repo_idx(&path) {
+                    self.repos[i].activity = Some(result);
+                }
             }
             Msg::Summarized { path, result } => {
                 if let Some(i) = self.repo_idx(&path) {
@@ -782,8 +847,7 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.move_sel(1_000_000),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(i) = self.selected_idx() {
-                    self.view = View::Detail { path: self.repos[i].path.clone(), scroll: 0, sel: None };
-                    self.prefetch_message(i);
+                    self.open_detail(i);
                 }
             }
             KeyCode::Char('s') => {
@@ -904,8 +968,7 @@ impl App {
                 self.sel_path = Some(path);
                 self.move_sel(if k.code == KeyCode::Char('n') { 1 } else { -1 });
                 if let Some(i) = self.selected_idx() {
-                    self.view = View::Detail { path: self.repos[i].path.clone(), scroll: 0, sel: None };
-                    self.prefetch_message(i);
+                    self.open_detail(i);
                 }
             }
             KeyCode::Char('s') => {
@@ -1009,6 +1072,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
             app.spawn_scan(vec![dir], false, false);
         }
         app.refresh_if_due();
+        app.summarize_if_lingering();
         let t = app.window_title();
         if t != title {
             let _ = execute!(io::stdout(), SetTitle(&t));
@@ -1030,6 +1094,7 @@ fn main() -> io::Result<()> {
     let mut root = None;
     let mut depth = 2;
     let mut auto = false;
+    let mut auto_summary = true;
     let mut interval = Duration::from_secs(5);
     let mut fetch_every = Some(Duration::from_secs(5 * 60));
     let mut args = std::env::args().skip(1);
@@ -1045,6 +1110,7 @@ fn main() -> io::Result<()> {
             }
             "-d" | "--depth" => depth = args.next().and_then(|v| v.parse().ok()).unwrap_or(depth),
             "-s" | "--summarize" => auto = true,
+            "--no-auto-summary" => auto_summary = false,
             "-i" | "--interval" => {
                 if let Some(secs) = args.next().and_then(|v| v.parse().ok()) {
                     interval = Duration::from_secs(secs);
@@ -1059,7 +1125,7 @@ fn main() -> io::Result<()> {
         }
     }
     let root = root.map_or_else(std::env::current_dir, Ok)?.canonicalize()?;
-    let mut app = App::new(root, depth, auto, interval, fetch_every);
+    let mut app = App::new(root, depth, auto, auto_summary, interval, fetch_every);
     app.rescan(false, false);
 
     let mut terminal = ratatui::init();

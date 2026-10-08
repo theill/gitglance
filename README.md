@@ -40,7 +40,7 @@ AI summaries and drafted commit messages are optional. They need the [Claude Cod
 | List | |
 |---|---|
 | `↑↓` `j/k` | move |
-| `⏎` | details (summary, unpushed commits, changed files with +/-) |
+| `⏎` | details: AI summary, unpushed commits, changed files with +/-, and commit activity (see [Repo details](#repo-details)) |
 | `s` / `S` | AI summary for this repo / for every listed repo without one |
 | `c` | commit everything and push (see below) |
 | `P` | push commits that are already made (asks first) |
@@ -60,6 +60,18 @@ In the detail view, `↑↓` highlights an unpushed commit or a changed file and
 A `●` in front of a repo means a background re-check just found it changed (the last minute), and a dim `•` means it changed in the last ten.
 
 Columns: **STATE** `S` staged, `M` modified, `?` untracked, `U` conflicts, `≡` stashes. **SYNC** `↑` ahead, `↓` behind (as of the last fetch), `unpushed` for a branch with no upstream, `local` for no remote.
+
+## Repo details
+
+`⏎` opens a repo. Next to its pending work (or below it, in a terminal narrower than 120 columns) is an **Activity** panel:
+
+- total commits and how long ago the repo started; commits today, this week and last week
+- a bar graph of commits per day over the last 6 weeks, and per week over the last 24 weeks
+- who made them over those 24 weeks, with their commits and lines added and removed
+
+The numbers cover all branches and leave out merges. Authors are grouped by `.mailmap` names. The panel loads in the background and updates when new commits land while you look at it.
+
+If the repo has changes and no summary yet, the AI summary starts on its own once the repo has been open for half a second. Paging past repos with `n`/`p`, or backing out right away, sends nothing. `--no-auto-summary` turns this off, so only `s` asks.
 
 ## Live dashboard
 
@@ -116,7 +128,7 @@ Ignored repos aren't scanned, so they also make the scan faster.
 
 These run `claude -p` with Haiku and no tools, in a neutral directory. The prompt gets the file list, unpushed commits, the diff (lockfiles left out, capped at 60 KB) and the start of new files. Results are cached in `~/.cache/gitglance`, keyed by that content, so a repo that hasn't changed never costs a second call.
 
-Code only leaves your machine when you ask for it: `s`, `S`, `c` or `--summarize`. Commit messages are drafted in the background only for repos you've already summarized. Secret-looking files (`.env*`, `*.pem`, `*.key`, `*.p8`, `*.p12`, SSH keys, anything named `credentials` or `secret`) are listed by name, but their contents are never sent.
+Code only leaves your machine when you ask for it: `s`, `S`, `c`, `--summarize`, or by opening a repo with changes for half a second (turn that off with `--no-auto-summary`). Commit messages are drafted in the background only for repos you've already summarized. Secret-looking files (`.env*`, `*.pem`, `*.key`, `*.p8`, `*.p12`, SSH keys, anything named `credentials` or `secret`) are listed by name, but their contents are never sent.
 
 - `GITGLANCE_MODEL=sonnet` picks another model.
 - `GITGLANCE_AI_CMD='llm -m gpt-4o-mini'` uses any command that reads the prompt on stdin.

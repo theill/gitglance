@@ -1,4 +1,4 @@
-use crate::git::Status;
+use crate::git::{self, Activity, Status};
 use crate::{ai, App, Modal, Repo, SummaryState, View};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, Wrap};
@@ -420,10 +420,33 @@ fn section(lines: &mut Vec<Line<'static>>, title: String, hint: &str) {
     lines.push(Line::from(vec![format!("── {title}").cyan().bold(), hint.dark_gray()]));
 }
 
+/// The activity panel sits to the right of the detail page when the terminal is at least this wide.
+const SIDE_BY_SIDE: u16 = 120;
+const PANEL_W: u16 = 52;
+
 fn detail(f: &mut Frame, area: Rect, app: &mut App) {
     let View::Detail { ref path, scroll, sel } = app.view else { return };
     let Some(i) = app.repo_idx(&path.clone()) else { return };
-    let (lines, items) = detail_lines(&app.repos[i], app.tick, sel);
+    let (mut lines, items) = detail_lines(&app.repos[i], app.tick, sel);
+    let area = if area.width >= SIDE_BY_SIDE {
+        let [main, side] = Layout::horizontal([Constraint::Min(40), Constraint::Length(PANEL_W)]).areas(area);
+        let mut panel = vec![Line::from("Activity".cyan().bold())];
+        panel.extend(activity_lines(&app.repos[i], app.tick));
+        f.render_widget(
+            Paragraph::new(panel).block(
+                Block::new()
+                    .borders(ratatui::widgets::Borders::LEFT)
+                    .border_style(Style::new().dark_gray())
+                    .padding(Padding::new(2, 1, 1, 0)),
+            ),
+            side,
+        );
+        main
+    } else {
+        section(&mut lines, "Activity".into(), "");
+        lines.extend(activity_lines(&app.repos[i], app.tick));
+        area
+    };
 
     // Keep the highlighted item on screen, estimating wrapped rows like the Paragraph will.
     let width = area.width.saturating_sub(4).max(1) as usize;
@@ -569,6 +592,153 @@ fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>
         }
     }
     (lines, items)
+}
+
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+fn day_label(day: i64) -> String {
+    let (_, m, d) = git::civil_from_days(day);
+    format!("{} {d}", MONTHS[m as usize - 1])
+}
+
+/// `1234` → `1,234`.
+fn thousands(n: u32) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `1234` → `1.2k`, for line counts.
+fn short(n: u32) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// A bar graph `height` rows tall, one column per value, in eighth-block steps.
+fn bars(values: &[u32], height: usize) -> Vec<String> {
+    const EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = values.iter().copied().max().unwrap_or(0).max(1) as usize;
+    let levels: Vec<usize> = values
+        .iter()
+        .map(|&v| if v == 0 { 0 } else { (v as usize * height * 8).div_ceil(max).max(1) })
+        .collect();
+    (0..height)
+        .map(|row| {
+            let floor = (height - 1 - row) * 8;
+            levels.iter().map(|&l| EIGHTHS[l.saturating_sub(floor).min(8)]).collect()
+        })
+        .collect()
+}
+
+/// A graph with a baseline: `·` marks empty columns, so a quiet period still shows. Each value is `col` wide:
+/// a bar of `col - 1` columns and a gap, or a single column when `col` is 1.
+fn graph(lines: &mut Vec<Line<'static>>, values: &[u32], height: usize, col: usize, color: Color) {
+    let widen = |c: char| match col {
+        1 => c.to_string(),
+        _ => format!("{}{}", c.to_string().repeat(col - 1), ' '),
+    };
+    for row in bars(values, height) {
+        lines.push(Line::from(row.chars().map(widen).collect::<String>().fg(color)));
+    }
+    let base: String = values.iter().map(|&v| widen(if v == 0 { '·' } else { '▔' })).collect();
+    lines.push(Line::from(base.dark_gray()));
+}
+
+/// A label at each end of a `width`-wide axis.
+fn axis(left: String, right: &str, width: usize) -> Line<'static> {
+    let gap = width.saturating_sub(left.chars().count() + right.chars().count());
+    Line::from(format!("{left}{}{right}", " ".repeat(gap)).dark_gray())
+}
+
+/// The activity panel: totals, commits per day and per week, and who made them.
+fn activity_lines(r: &Repo, tick: usize) -> Vec<Line<'static>> {
+    let a: &Activity = match &r.activity {
+        None => return vec![Line::from(format!("{} counting commits…", spin(tick)).cyan())],
+        Some(Err(e)) => return vec![Line::from(format!("No history: {e}").dark_gray())],
+        Some(Ok(a)) => a,
+    };
+    if a.total_commits == 0 {
+        return vec![Line::from("No commits yet.".dark_gray())];
+    }
+    let mut lines = Vec::new();
+    let mut total = vec![thousands(a.total_commits).bold(), " commits".into()];
+    if let Some(ts) = a.first_commit_ts {
+        total.push(match ago(ts).as_str() {
+            "now" => " · started just now".dark_gray(),
+            a => format!(" · started {a} ago").dark_gray(),
+        });
+    }
+    lines.push(Line::from(total));
+    let (today, week, last_week) =
+        (a.days[git::DAYS - 1], a.weeks[git::WEEKS - 1], a.weeks.get(git::WEEKS - 2).copied().unwrap_or(0));
+    lines.push(Line::from(vec![
+        "today ".dark_gray(),
+        today.to_string().bold(),
+        "   this week ".dark_gray(),
+        week.to_string().bold(),
+        "   last week ".dark_gray(),
+        last_week.to_string().bold(),
+    ]));
+    lines.push(Line::from("all branches, merges left out".dark_gray().italic()));
+
+    let max_day = a.days.iter().max().copied().unwrap_or(0);
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        "Per day".bold(),
+        format!(", last {} days  ", git::DAYS).dark_gray(),
+        format!("max {max_day}").dark_gray(),
+    ]));
+    graph(&mut lines, &a.days, 3, 1, Color::Cyan);
+    lines.push(axis(day_label(a.today - git::DAYS as i64 + 1), "today", git::DAYS));
+
+    let max_week = a.weeks.iter().max().copied().unwrap_or(0);
+    let in_window: u32 = a.weeks.iter().sum();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        "Per week".bold(),
+        format!(", {in_window} in {} weeks  ", git::WEEKS).dark_gray(),
+        format!("max {max_week}").dark_gray(),
+    ]));
+    graph(&mut lines, &a.weeks, 3, 2, Color::Magenta);
+    let first_monday = a.today - git::weekday(a.today) - 7 * (git::WEEKS as i64 - 1);
+    lines.push(axis(day_label(first_monday), "this week", git::WEEKS * 2 - 1));
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec!["Who".bold(), format!(", last {} weeks", git::WEEKS).dark_gray()]));
+    if a.authors.is_empty() {
+        lines.push(Line::from("nobody committed in this period".dark_gray()));
+    }
+    let top = a.authors.first().map_or(1, |x| x.commits.max(1));
+    const BAR: usize = 10;
+    for au in a.authors.iter().take(6) {
+        let eighths = (au.commits as usize * BAR * 8).div_ceil(top as usize);
+        let mut bar = "█".repeat(eighths / 8);
+        if !eighths.is_multiple_of(8) {
+            bar.push(['▏', '▎', '▍', '▌', '▋', '▊', '▉'][eighths % 8 - 1]);
+        }
+        lines.push(Line::from(vec![
+            format!("{bar:<BAR$} ").cyan(),
+            format!("{:>4} ", au.commits).bold(),
+            format!("{:<16} ", trunc(&au.name, 16)).into(),
+            format!("+{}", short(au.added)).green(),
+            " ".into(),
+            format!("-{}", short(au.removed)).red(),
+        ]));
+    }
+    if a.authors.len() > 6 {
+        let rest: u32 = a.authors[6..].iter().map(|x| x.commits).sum();
+        lines.push(Line::from(format!("… {} more, {rest} commits", a.authors.len() - 6).dark_gray()));
+    }
+    lines
 }
 
 fn diff(f: &mut Frame, area: Rect, title: &str, lines: &[String], scroll: u16) {
