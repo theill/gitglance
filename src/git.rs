@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct FileChange {
     pub code: String,
     pub path: String,
@@ -9,7 +9,7 @@ pub struct FileChange {
     pub removed: Option<u32>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Status {
     pub branch: String,
     pub upstream: Option<String>,

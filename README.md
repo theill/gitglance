@@ -2,6 +2,8 @@
 
 A quick TUI that shows which repos in a folder have pending work: uncommitted files, unpushed commits, or a branch that is behind. Each one can get a short AI summary.
 
+It stays live: leave it open next to the sessions that are working in your repos, and it picks up their changes on its own, so a glance at the window tells you what still needs a commit, a push or a pull (see [Live dashboard](#live-dashboard)).
+
 ```bash
 cd ~/code && gitglance          # or: gitglance ~/code --depth 2 --summarize
 ```
@@ -49,11 +51,32 @@ AI summaries and drafted commit messages are optional. They need the [Claude Cod
 | `x` | ignore this repo (adds it to `.gitglanceignore`); press `x` on an ignored repo to un-ignore it |
 | `I` | show or hide ignored repos |
 | `r` / `f` | rescan / `git fetch --all` everywhere, then rescan |
+| `w` | pause or resume the live refresh |
+| `t` | open a shell in the repo (your `$SHELL`); `exit` brings you back |
 | `o` | open the repo folder in your file manager (Finder on macOS, `xdg-open` on Linux) |
 
 In the detail view, `↑↓` highlights an unpushed commit or a changed file and `⏎` opens it: a commit as its full `git show`, a file as its diff (or its contents, if it's new). Esc goes back to the same spot. `n`/`p` jumps to the next or previous repo.
 
+A `●` in front of a repo means a background re-check just found it changed (the last minute), and a dim `•` means it changed in the last ten.
+
 Columns: **STATE** `S` staged, `M` modified, `?` untracked, `U` conflicts, `≡` stashes. **SYNC** `↑` ahead, `↓` behind (as of the last fetch), `unpushed` for a branch with no upstream, `local` for no remote.
+
+## Live dashboard
+
+gitglance re-checks every repo every 5 seconds, and runs `git fetch --all` on all of them every 5 minutes (the first fetch starts right after the opening scan). Changes made elsewhere, by you in an editor or by an agent in another session, show up without a key press:
+
+- New, changed or cleaned-up repos appear and disappear from the list, and repos cloned into the folder show up too.
+- Repos that changed get a `●` marker; the detail view says how long ago.
+- `↓N` appears once a fetch sees new commits upstream, so you know to pull.
+- The terminal window title shows the count, like `3 pending · ↓1 · gitglance ~/code`, so you can see it from a tab or taskbar. The title is put back when gitglance quits.
+
+Background re-checks are quiet: no spinners, and they never call the AI. With `--summarize`, only the scans you start (on launch, `r`, `f`) summarize automatically.
+
+```bash
+gitglance ~/code --interval 10 --fetch-every 15   # gentler
+gitglance ~/code --fetch-every 0                  # never fetch on its own
+gitglance ~/code --interval 0                     # start paused; w resumes
+```
 
 ## Commit and push
 

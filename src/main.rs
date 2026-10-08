@@ -10,17 +10,24 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 const HELP: &str = "gitglance - overview of pending git changes in every repo below a folder
 
 USAGE:
-    gitglance [DIR] [--depth N] [--summarize]
+    gitglance [DIR] [--depth N] [--summarize] [--interval SECS] [--fetch-every MINS]
 
     DIR            folder to scan (default: current directory)
     -d, --depth N  how deep to look for repos below DIR (default: 2)
     -s, --summarize
                    ask the AI for a summary of every repo with changes on start
+    -i, --interval SECS
+                   re-check every repo this often, so changes made in other sessions show
+                   up on their own (default: 5, 0 starts paused; w toggles it)
+    -F, --fetch-every MINS
+                   fetch every repo in the background this often, so `behind` stays
+                   current (default: 5, 0 turns it off)
 
 Press x on a repo to ignore it. Ignored repos are listed in DIR/.gitglanceignore, one
 per line as their path relative to DIR (`unops/opportunityplus`). A line hides exactly
@@ -28,6 +35,7 @@ that repo, never repos nested below it.
 
 Press c to commit everything in a repo (Claude drafts the message) and push,
 P to push commits that are already made, or u to pull in commits you are behind on.
+Press t for a shell in the selected repo; exit it to come back.
 
 AI summaries run `claude -p` (model from GITGLANCE_MODEL, default haiku) and are
 cached in ~/.cache/gitglance. Set GITGLANCE_AI_CMD to use any other command that
@@ -50,6 +58,12 @@ pub struct Repo {
     pub context: Option<String>,
     pub summary: SummaryState,
     pub busy: bool,
+    /// A background re-check is running; unlike `busy`, it shows no spinner.
+    checking: bool,
+    /// Bumped for every scan, so a slow, older result can't overwrite a newer one.
+    gen: u64,
+    /// When a re-check last found something different, so the list can mark what moved.
+    pub changed_at: Option<Instant>,
     pub ignored: bool,
 }
 
@@ -69,6 +83,9 @@ impl Repo {
             context: None,
             summary: SummaryState::None,
             busy: false,
+            checking: false,
+            gen: 0,
+            changed_at: None,
             ignored: false,
         }
     }
@@ -86,7 +103,14 @@ impl Repo {
 }
 
 enum Msg {
-    Scanned { path: PathBuf, status: Result<git::Status, String>, context: Option<String>, cached: Option<String> },
+    Scanned {
+        path: PathBuf,
+        gen: u64,
+        quiet: bool,
+        status: Box<Result<git::Status, String>>,
+        context: Option<String>,
+        cached: Option<String>,
+    },
     Summarized { path: PathBuf, result: Result<String, String> },
     CommitMessage { path: PathBuf, result: Result<String, String> },
     GitDone { path: PathBuf, result: Result<String, String> },
@@ -153,13 +177,21 @@ pub struct App {
     drafting: HashSet<PathBuf>,
     pub tick: usize,
     pub notice: Option<String>,
+    /// Live mode: re-check every repo every `interval`, and fetch every `fetch_every`.
+    pub live: bool,
+    interval: Duration,
+    pub fetch_every: Option<Duration>,
+    last_check: Instant,
+    pub last_fetch: Option<Instant>,
+    /// A repo to open a shell in; the run loop does it, since it owns the terminal.
+    shell: Option<PathBuf>,
     tx: mpsc::Sender<Msg>,
     rx: mpsc::Receiver<Msg>,
     ai_tx: mpsc::Sender<(PathBuf, String, bool)>,
 }
 
 impl App {
-    fn new(root: PathBuf, depth: usize, auto: bool) -> Self {
+    fn new(root: PathBuf, depth: usize, auto: bool, interval: Duration, fetch_every: Option<Duration>) -> Self {
         let (tx, rx) = mpsc::channel();
         let (ai_tx, ai_rx) = mpsc::channel::<(PathBuf, String, bool)>();
         let ai_rx = Arc::new(Mutex::new(ai_rx));
@@ -200,6 +232,12 @@ impl App {
             drafting: HashSet::new(),
             tick: 0,
             notice: None,
+            live: !interval.is_zero(),
+            interval: if interval.is_zero() { Duration::from_secs(5) } else { interval },
+            fetch_every,
+            last_check: Instant::now(),
+            last_fetch: None,
+            shell: None,
             tx,
             rx,
             ai_tx,
@@ -250,7 +288,12 @@ impl App {
         self.repos.iter().position(|r| r.path == path)
     }
 
-    fn rescan(&mut self, fetch: bool) {
+    /// A quiet rescan is the live refresh: no spinners, no notice, and it skips repos that are already being scanned.
+    fn rescan(&mut self, fetch: bool, quiet: bool) {
+        self.last_check = Instant::now();
+        if fetch {
+            self.last_fetch = Some(Instant::now());
+        }
         let paths = git::discover(&self.root, self.depth);
         let mut old: HashMap<PathBuf, Repo> = self.repos.drain(..).map(|r| (r.path.clone(), r)).collect();
         let root = self.root.clone();
@@ -260,26 +303,38 @@ impl App {
         for r in &mut self.repos {
             r.ignored = self.ignore.is_ignored(&r.rel);
         }
-        let paths: Vec<PathBuf> = self.repos.iter().filter(|r| !r.ignored).map(|r| r.path.clone()).collect();
-        self.spawn_scan(paths, fetch);
+        let paths: Vec<PathBuf> = self
+            .repos
+            .iter()
+            .filter(|r| !r.ignored && !(quiet && (r.busy || r.checking)))
+            .map(|r| r.path.clone())
+            .collect();
+        self.spawn_scan(paths, fetch, quiet);
     }
 
-    fn spawn_scan(&mut self, paths: Vec<PathBuf>, fetch: bool) {
+    fn spawn_scan(&mut self, paths: Vec<PathBuf>, fetch: bool, quiet: bool) {
+        let mut jobs = Vec::new();
         for r in &mut self.repos {
             if paths.contains(&r.path) {
-                r.busy = true;
+                r.gen += 1;
+                if quiet {
+                    r.checking = true;
+                } else {
+                    r.busy = true;
+                }
+                jobs.push((r.path.clone(), r.gen));
             }
         }
-        if fetch {
-            self.notice = Some(format!("Fetching {} repos…", paths.len()));
+        if fetch && !quiet {
+            self.notice = Some(format!("Fetching {} repos…", jobs.len()));
         }
-        let workers = if fetch { 8 } else { 16 }.min(paths.len().max(1));
-        let jobs = Arc::new(Mutex::new(paths.into_iter().rev().collect::<Vec<_>>()));
+        let workers = if fetch { 8 } else { 16 }.min(jobs.len().max(1));
+        let jobs = Arc::new(Mutex::new(jobs.into_iter().rev().collect::<Vec<_>>()));
         for _ in 0..workers {
             let (jobs, tx) = (jobs.clone(), self.tx.clone());
             thread::spawn(move || loop {
                 let next = jobs.lock().unwrap().pop();
-                let Some(path) = next else { break };
+                let Some((path, gen)) = next else { break };
                 if fetch {
                     let _ = git::fetch(&path);
                 }
@@ -292,7 +347,7 @@ impl App {
                     }
                     _ => (None, None),
                 };
-                if tx.send(Msg::Scanned { path, status, context, cached }).is_err() {
+                if tx.send(Msg::Scanned { path, gen, quiet, status: Box::new(status), context, cached }).is_err() {
                     break;
                 }
             });
@@ -329,7 +384,7 @@ impl App {
             r.ignored = ignored;
         }
         if !back.is_empty() {
-            self.spawn_scan(back, false);
+            self.spawn_scan(back, false, false);
         }
     }
 
@@ -508,6 +563,35 @@ impl App {
         }
     }
 
+    /// Live mode: quietly re-checks every repo, and fetches now and then, so work done in other sessions shows up
+    /// without a key press. The first fetch waits for the startup scan, so the list appears right away.
+    fn refresh_if_due(&mut self) {
+        if !self.live {
+            return;
+        }
+        let fetch = self.fetch_every.is_some_and(|every| match self.last_fetch {
+            Some(t) => t.elapsed() >= every,
+            None => !self.repos.iter().any(|r| r.busy),
+        });
+        if fetch || self.last_check.elapsed() >= self.interval {
+            self.rescan(fetch, true);
+        }
+    }
+
+    /// The terminal window title, so pending work shows in a taskbar or tab bar without looking at the window.
+    fn window_title(&self) -> String {
+        let pending = self.repos.iter().filter(|r| r.attention()).count();
+        let behind = self.repos.iter().filter(|r| !r.ignored && matches!(&r.status, Some(Ok(s)) if s.behind > 0)).count();
+        let mut t = match pending {
+            0 => "✓".to_string(),
+            n => format!("{n} pending"),
+        };
+        if behind > 0 {
+            t.push_str(&format!(" · ↓{behind}"));
+        }
+        format!("{t} · gitglance {}", self.root_display)
+    }
+
     fn summarize(&mut self, i: usize, force: bool) {
         let r = &mut self.repos[i];
         if matches!(r.summary, SummaryState::Pending) || (!force && matches!(r.summary, SummaryState::Done(_))) {
@@ -531,18 +615,30 @@ impl App {
 
     fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Scanned { path, status, context, cached } => {
+            Msg::Scanned { path, gen, quiet, status, context, cached } => {
                 let Some(i) = self.repo_idx(&path) else { return };
                 let r = &mut self.repos[i];
-                r.busy = false;
-                r.status = Some(status);
-                r.context = context;
-                match cached {
-                    Some(c) => r.summary = SummaryState::Done(c),
-                    None if !matches!(r.summary, SummaryState::Pending) => r.summary = SummaryState::None,
-                    None => {}
+                if gen != r.gen {
+                    return;
                 }
-                if self.auto && self.repos[i].context.is_some() {
+                let status = *status;
+                r.busy = false;
+                r.checking = false;
+                if matches!((&r.status, &status), (Some(Ok(old)), Ok(new)) if old != new) {
+                    r.changed_at = Some(Instant::now());
+                }
+                r.status = Some(status);
+                // A re-check that finds the same changes keeps the summary as it is (a failure message, too).
+                if !quiet || r.context != context {
+                    r.context = context;
+                    match cached {
+                        Some(c) => r.summary = SummaryState::Done(c),
+                        None if !matches!(r.summary, SummaryState::Pending) => r.summary = SummaryState::None,
+                        None => {}
+                    }
+                }
+                // Background re-checks never call the AI on their own; only a scan you started does.
+                if self.auto && !quiet && self.repos[i].context.is_some() {
                     self.summarize(i, false);
                 }
             }
@@ -566,7 +662,7 @@ impl App {
                     Ok(m) => format!("{name}: {m} ✓"),
                     Err(e) => format!("{name}: {e}"),
                 });
-                self.spawn_scan(vec![path], false);
+                self.spawn_scan(vec![path], false, false);
             }
             Msg::Summarized { path, result } => {
                 if let Some(i) = self.repo_idx(&path) {
@@ -722,8 +818,24 @@ impl App {
                     self.open_in_file_manager(i);
                 }
             }
-            KeyCode::Char('r') => self.rescan(false),
-            KeyCode::Char('f') => self.rescan(true),
+            KeyCode::Char('t') => {
+                if let Some(i) = self.selected_idx() {
+                    self.shell = Some(self.repos[i].path.clone());
+                }
+            }
+            KeyCode::Char('r') => self.rescan(false, false),
+            KeyCode::Char('f') => self.rescan(true, false),
+            KeyCode::Char('w') => {
+                self.live = !self.live;
+                if self.live {
+                    self.rescan(false, true);
+                }
+                self.notice = Some(if self.live {
+                    format!("Live: re-checking every {}s, w pauses", self.interval.as_secs())
+                } else {
+                    "Paused: the list only changes when you press r or f, w resumes".into()
+                });
+            }
             KeyCode::Char('a') => self.show_all = !self.show_all,
             KeyCode::Char('x') => {
                 if let Some(i) = self.selected_idx() {
@@ -826,7 +938,8 @@ impl App {
                     self.open_in_file_manager(i);
                 }
             }
-            KeyCode::Char('r') => self.rescan(false),
+            KeyCode::Char('t') => self.shell = Some(path),
+            KeyCode::Char('r') => self.rescan(false, false),
             _ => {}
         }
         false
@@ -855,10 +968,51 @@ impl App {
     }
 }
 
+// xterm's title stack: save the terminal's own title on start and put it back on the way out.
+const PUSH_TITLE: &str = "\x1b[22;0t";
+const POP_TITLE: &str = "\x1b[23;0t";
+
+fn write_raw(s: &str) {
+    use std::io::Write;
+    let mut out = io::stdout();
+    let _ = out.write_all(s.as_bytes());
+    let _ = out.flush();
+}
+
+/// Hands the terminal to a shell in `dir` until it exits, then takes it back.
+fn open_shell(terminal: &mut ratatui::DefaultTerminal, dir: &Path) -> io::Result<()> {
+    use ratatui::crossterm::{execute, terminal as term};
+    ratatui::restore();
+    write_raw(POP_TITLE);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
+    println!("\n  gitglance: shell in {}, exit (or ctrl+d) to go back\n", dir.display());
+    if let Err(e) = Command::new(&shell).current_dir(dir).status() {
+        eprintln!("could not start {shell}: {e}");
+        thread::sleep(Duration::from_secs(2));
+    }
+    write_raw(PUSH_TITLE);
+    term::enable_raw_mode()?;
+    execute!(io::stdout(), term::EnterAlternateScreen)?;
+    terminal.clear()
+}
+
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
+    use ratatui::crossterm::{execute, terminal::SetTitle};
+    let mut title = String::new();
     loop {
         while let Ok(msg) = app.rx.try_recv() {
             app.handle(msg);
+        }
+        if let Some(dir) = app.shell.take() {
+            open_shell(terminal, &dir)?;
+            title.clear();
+            app.spawn_scan(vec![dir], false, false);
+        }
+        app.refresh_if_due();
+        let t = app.window_title();
+        if t != title {
+            let _ = execute!(io::stdout(), SetTitle(&t));
+            title = t;
         }
         terminal.draw(|f| ui::draw(f, app))?;
         if event::poll(Duration::from_millis(80))? {
@@ -876,6 +1030,8 @@ fn main() -> io::Result<()> {
     let mut root = None;
     let mut depth = 2;
     let mut auto = false;
+    let mut interval = Duration::from_secs(5);
+    let mut fetch_every = Some(Duration::from_secs(5 * 60));
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -889,15 +1045,27 @@ fn main() -> io::Result<()> {
             }
             "-d" | "--depth" => depth = args.next().and_then(|v| v.parse().ok()).unwrap_or(depth),
             "-s" | "--summarize" => auto = true,
+            "-i" | "--interval" => {
+                if let Some(secs) = args.next().and_then(|v| v.parse().ok()) {
+                    interval = Duration::from_secs(secs);
+                }
+            }
+            "-F" | "--fetch-every" => {
+                if let Some(mins) = args.next().and_then(|v| v.parse::<u64>().ok()) {
+                    fetch_every = (mins > 0).then(|| Duration::from_secs(mins * 60));
+                }
+            }
             other => root = Some(PathBuf::from(other)),
         }
     }
     let root = root.map_or_else(std::env::current_dir, Ok)?.canonicalize()?;
-    let mut app = App::new(root, depth, auto);
-    app.rescan(false);
+    let mut app = App::new(root, depth, auto, interval, fetch_every);
+    app.rescan(false, false);
 
     let mut terminal = ratatui::init();
+    write_raw(PUSH_TITLE);
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
+    write_raw(POP_TITLE);
     result
 }

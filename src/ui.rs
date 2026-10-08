@@ -2,7 +2,7 @@ use crate::git::Status;
 use crate::{ai, App, Modal, Repo, SummaryState, View};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, Wrap};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SELECTED_BG: Color = Color::Indexed(237);
@@ -21,6 +21,25 @@ pub fn ago(ts: i64) -> String {
         86_400..=2_591_999 => format!("{}d", d / 86_400),
         2_592_000..=31_535_999 => format!("{}mo", d / 2_592_000),
         _ => format!("{}y", d / 31_536_000),
+    }
+}
+
+/// Short age of something that happened in this session: `12s`, `4m`, `2h`.
+fn since(t: Instant) -> String {
+    let d = t.elapsed().as_secs();
+    match d {
+        0..=59 => format!("{d}s"),
+        60..=3_599 => format!("{}m", d / 60),
+        _ => format!("{}h", d / 3_600),
+    }
+}
+
+/// Marks a repo a background re-check found changed: bright for the first minute, dim for ten.
+fn change_mark(r: &Repo) -> Span<'static> {
+    match r.changed_at.map(|t| t.elapsed()) {
+        Some(d) if d < Duration::from_secs(60) => "●".yellow().bold(),
+        Some(d) if d < Duration::from_secs(600) => "•".dark_gray(),
+        _ => " ".into(),
     }
 }
 
@@ -143,6 +162,16 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
         spans.push(format!("   {} summarizing {thinking}", spin(app.tick)).magenta());
     }
     spans.push(if app.show_all { "   [all repos]".dark_gray() } else { "   [with changes]".dark_gray() });
+    if app.live {
+        spans.push("   ● live".green());
+        spans.push(match (app.fetch_every, app.last_fetch) {
+            (None, _) => " · no auto-fetch".dark_gray(),
+            (Some(_), Some(t)) => format!(" · fetched {} ago", since(t)).dark_gray(),
+            (Some(_), None) => " · fetching soon".dark_gray(),
+        });
+    } else {
+        spans.push("   ○ paused, w resumes".dark_gray());
+    }
     if app.filtering || !app.filter.is_empty() {
         spans.push(format!("   /{}", app.filter).yellow());
         if app.filtering {
@@ -189,6 +218,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("x", "ignore"),
             ("I", "show ignored"),
             ("/", "filter"),
+            ("t", "shell"),
             ("r", "refresh"),
             ("f", "fetch"),
             ("q", "quit"),
@@ -203,6 +233,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("P", "push"),
             ("u", "pull"),
             ("d", "diff"),
+            ("t", "shell"),
             ("o", "open folder"),
             ("r", "refresh"),
             ("q", "quit"),
@@ -296,12 +327,13 @@ fn row(r: &Repo, tick: usize, name_w: usize) -> Row<'static> {
         _ => Style::new().dark_gray(),
     };
     if r.ignored {
-        let mut cells = vec![Cell::from(Span::styled(trunc(&r.name, name_w), Style::new().dark_gray().crossed_out()))];
+        let name = Line::from(vec!["  ".into(), Span::styled(trunc(&r.name, name_w), Style::new().dark_gray().crossed_out())]);
+        let mut cells = vec![Cell::from(name)];
         cells.extend((0..6).map(|_| Cell::from("")));
         cells.push(Cell::from("ignored  (x to un-ignore)".dark_gray()));
         return Row::new(cells);
     }
-    let name = Cell::from(Span::styled(trunc(&r.name, name_w), name_style));
+    let name = Cell::from(Line::from(vec![change_mark(r), " ".into(), Span::styled(trunc(&r.name, name_w), name_style)]));
     let s = match &r.status {
         None => return Row::new(vec![name, Cell::from(spin(tick).to_string().cyan())]),
         Some(Err(e)) => {
@@ -359,12 +391,12 @@ fn list(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     let name_w = vis.iter().map(|&i| app.repos[i].name.chars().count()).max().unwrap_or(4).clamp(4, 30);
-    let header = Row::new(["REPO", "BRANCH", "FILES", "STATE", "+/-", "SYNC", "AGE", "SUMMARY"])
+    let header = Row::new(["  REPO", "BRANCH", "FILES", "STATE", "+/-", "SYNC", "AGE", "SUMMARY"])
         .style(Style::new().dark_gray().bold())
         .bottom_margin(0);
     let rows: Vec<Row> = vis.iter().map(|&i| row(&app.repos[i], app.tick, name_w)).collect();
     let widths = [
-        Constraint::Length(name_w as u16),
+        Constraint::Length(name_w as u16 + 2),
         Constraint::Length(18),
         Constraint::Length(5),
         Constraint::Length(13),
@@ -430,11 +462,11 @@ fn item_line(spans: Vec<Span<'static>>, selected: bool) -> Line<'static> {
 /// The page's lines plus the line index of each selectable item (see `detail_items`).
 fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut items = Vec::new();
-    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
-        r.name.clone().yellow().bold(),
-        "   ".into(),
-        r.path.display().to_string().dark_gray(),
-    ])];
+    let mut title = vec![r.name.clone().yellow().bold(), "   ".into(), r.path.display().to_string().dark_gray()];
+    if let Some(t) = r.changed_at {
+        title.extend(["   ".into(), change_mark(r), format!(" changed {} ago", since(t)).dark_gray()]);
+    }
+    let mut lines: Vec<Line<'static>> = vec![Line::from(title)];
     let s = match &r.status {
         None => {
             lines.push(Line::from(format!("{} scanning…", spin(tick)).cyan()));
