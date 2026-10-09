@@ -248,35 +248,47 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Line::from(spans), area);
 }
 
+/// Puts a space between spans, so a cell is no wider than its content.
+fn spaced(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let mut out = Vec::with_capacity(spans.len() * 2);
+    for (i, sp) in spans.into_iter().enumerate() {
+        if i > 0 {
+            out.push(" ".into());
+        }
+        out.push(sp);
+    }
+    out
+}
+
 fn state_spans(s: &Status) -> Vec<Span<'static>> {
     let mut v = Vec::new();
     if s.conflicts > 0 {
-        v.push(format!("U{} ", s.conflicts).red().bold());
+        v.push(format!("U{}", s.conflicts).red().bold());
     }
     if s.staged > 0 {
-        v.push(format!("S{} ", s.staged).green());
+        v.push(format!("S{}", s.staged).green());
     }
     if s.unstaged > 0 {
-        v.push(format!("M{} ", s.unstaged).yellow());
+        v.push(format!("M{}", s.unstaged).yellow());
     }
     if s.untracked > 0 {
-        v.push(format!("?{} ", s.untracked).blue());
+        v.push(format!("?{}", s.untracked).blue());
     }
     if s.stashes > 0 {
         v.push(format!("≡{}", s.stashes).dark_gray());
     }
-    v
+    spaced(v)
 }
 
 fn lines_spans(s: &Status) -> Vec<Span<'static>> {
     let mut v = Vec::new();
     if s.insertions > 0 {
-        v.push(format!("+{} ", s.insertions).green());
+        v.push(format!("+{}", s.insertions).green());
     }
     if s.deletions > 0 {
         v.push(format!("-{}", s.deletions).red());
     }
-    v
+    spaced(v)
 }
 
 fn sync_spans(s: &Status) -> Vec<Span<'static>> {
@@ -286,7 +298,7 @@ fn sync_spans(s: &Status) -> Vec<Span<'static>> {
     if s.tracking {
         let mut v = Vec::new();
         if s.ahead > 0 {
-            v.push(format!("↑{} ", s.ahead).cyan().bold());
+            v.push(format!("↑{}", s.ahead).cyan().bold());
         }
         if s.behind > 0 {
             v.push(format!("↓{}", s.behind).magenta().bold());
@@ -294,13 +306,13 @@ fn sync_spans(s: &Status) -> Vec<Span<'static>> {
         if v.is_empty() {
             v.push("✓".green());
         }
-        return v;
+        return spaced(v);
     }
     if !s.has_remote {
         return vec!["local".dark_gray()];
     }
     if s.unpushed_count > 0 {
-        vec![format!("↑{} ", s.unpushed_count).cyan().bold(), "unpushed".cyan()]
+        spaced(vec![format!("↑{}", s.unpushed_count).cyan().bold(), "unpushed".cyan()])
     } else if s.upstream.is_some() {
         vec!["upstream gone".dark_gray()]
     } else {
@@ -318,7 +330,11 @@ fn summary_cell(r: &Repo, tick: usize) -> Line<'static> {
     }
 }
 
-fn row(r: &Repo, tick: usize, name_w: usize) -> Row<'static> {
+const COLUMNS: [&str; 7] = ["  REPO", "BRANCH", "STATE", "+/-", "SYNC", "AGE", "SUMMARY"];
+
+/// One list row as plain lines (one per column in `COLUMNS`), so the list can size each column to its content.
+fn row(r: &Repo, tick: usize, name_w: usize) -> Vec<Line<'static>> {
+    let blank = || Line::raw("");
     let name_style = match &r.status {
         Some(Ok(s)) if s.conflicts > 0 => Style::new().red().bold(),
         Some(Ok(s)) if s.dirty() => Style::new().yellow().bold(),
@@ -328,26 +344,19 @@ fn row(r: &Repo, tick: usize, name_w: usize) -> Row<'static> {
     };
     if r.ignored {
         let name = Line::from(vec!["  ".into(), Span::styled(trunc(&r.name, name_w), Style::new().dark_gray().crossed_out())]);
-        let mut cells = vec![Cell::from(name)];
-        cells.extend((0..6).map(|_| Cell::from("")));
-        cells.push(Cell::from("ignored  (x to un-ignore)".dark_gray()));
-        return Row::new(cells);
+        let mut cells = vec![name];
+        cells.extend((0..5).map(|_| blank()));
+        cells.push(Line::from("ignored  (x to un-ignore)".dark_gray()));
+        return cells;
     }
-    let name = Cell::from(Line::from(vec![change_mark(r), " ".into(), Span::styled(trunc(&r.name, name_w), name_style)]));
+    let name = Line::from(vec![change_mark(r), " ".into(), Span::styled(trunc(&r.name, name_w), name_style)]);
     let s = match &r.status {
-        None => return Row::new(vec![name, Cell::from(spin(tick).to_string().cyan())]),
+        None => return vec![name, Line::from(spin(tick).to_string().cyan())],
         Some(Err(e)) => {
-            let blank = || Cell::from("");
-            return Row::new(vec![
-                name,
-                blank(),
-                blank(),
-                blank(),
-                blank(),
-                blank(),
-                blank(),
-                Cell::from(format!("git error: {e}").red()),
-            ]);
+            let mut cells = vec![name];
+            cells.extend((0..5).map(|_| blank()));
+            cells.push(Line::from(format!("git error: {e}").red()));
+            return cells;
         }
         Some(Ok(s)) => s,
     };
@@ -355,21 +364,20 @@ fn row(r: &Repo, tick: usize, name_w: usize) -> Row<'static> {
         "main" | "master" => Style::new(),
         _ => Style::new().magenta(),
     };
-    let files = if s.dirty() { s.files.len().to_string().bold() } else { "·".dark_gray() };
-    let mut cells = vec![
+    let age = if r.busy {
+        spin(tick).to_string().cyan()
+    } else {
+        s.last_commit_ts.map(ago).unwrap_or_default().dark_gray()
+    };
+    vec![
         name,
-        Cell::from(Span::styled(trunc(&s.branch, 18), branch_style)),
-        Cell::from(Line::from(files).right_aligned()),
-        Cell::from(Line::from(state_spans(s))),
-        Cell::from(Line::from(lines_spans(s))),
-        Cell::from(Line::from(sync_spans(s))),
-        Cell::from(s.last_commit_ts.map(ago).unwrap_or_default().dark_gray()),
-        Cell::from(summary_cell(r, tick)),
-    ];
-    if r.busy {
-        cells[6] = Cell::from(spin(tick).to_string().cyan());
-    }
-    Row::new(cells)
+        Line::from(Span::styled(trunc(&s.branch, 18), branch_style)),
+        Line::from(state_spans(s)),
+        Line::from(lines_spans(s)),
+        Line::from(sync_spans(s)),
+        Line::from(age),
+        summary_cell(r, tick),
+    ]
 }
 
 fn list(f: &mut Frame, area: Rect, app: &mut App) {
@@ -391,20 +399,17 @@ fn list(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     let name_w = vis.iter().map(|&i| app.repos[i].name.chars().count()).max().unwrap_or(4).clamp(4, 30);
-    let header = Row::new(["  REPO", "BRANCH", "FILES", "STATE", "+/-", "SYNC", "AGE", "SUMMARY"])
-        .style(Style::new().dark_gray().bold())
-        .bottom_margin(0);
-    let rows: Vec<Row> = vis.iter().map(|&i| row(&app.repos[i], app.tick, name_w)).collect();
-    let widths = [
-        Constraint::Length(name_w as u16 + 2),
-        Constraint::Length(18),
-        Constraint::Length(5),
-        Constraint::Length(13),
-        Constraint::Length(13),
-        Constraint::Length(12),
-        Constraint::Length(4),
-        Constraint::Fill(1),
-    ];
+    let cells: Vec<Vec<Line>> = vis.iter().map(|&i| row(&app.repos[i], app.tick, name_w)).collect();
+    // Every column but the summary is as wide as its widest cell (or header); the summary gets the rest.
+    let mut widths: Vec<Constraint> = (0..COLUMNS.len() - 1)
+        .map(|c| {
+            let content = cells.iter().filter_map(|r| r.get(c)).map(Line::width).max().unwrap_or(0);
+            Constraint::Length(content.max(COLUMNS[c].len()) as u16)
+        })
+        .collect();
+    widths.push(Constraint::Fill(1));
+    let header = Row::new(COLUMNS).style(Style::new().dark_gray().bold()).bottom_margin(0);
+    let rows: Vec<Row> = cells.into_iter().map(|r| Row::new(r.into_iter().map(Cell::from))).collect();
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
