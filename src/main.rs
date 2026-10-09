@@ -23,8 +23,9 @@ USAGE:
     -s, --summarize
                    ask the AI for a summary of every repo with changes on start
     --no-auto-summary
-                   don't summarize a repo's changes on your behalf when you open it
-                   (by default, opening a repo with changes for half a second does)
+                   don't summarize changes on your behalf. By default, opening a repo with
+                   changes for half a second does, and so do new changes the live refresh
+                   finds once they have stayed the same for 10 seconds
     -i, --interval SECS
                    re-check every repo this often, so changes made in other sessions show
                    up on their own (default: 5, 0 starts paused; w toggles it)
@@ -67,6 +68,8 @@ pub struct Repo {
     gen: u64,
     /// When a re-check last found something different, so the list can mark what moved.
     pub changed_at: Option<Instant>,
+    /// New changes the live refresh found, waiting to stay put for `SETTLE` before the AI summarizes them.
+    pub settling: Option<Instant>,
     /// Commit activity for the detail page, loaded when the repo is opened.
     pub activity: Option<Result<git::Activity, String>>,
     pub ignored: bool,
@@ -91,6 +94,7 @@ impl Repo {
             checking: false,
             gen: 0,
             changed_at: None,
+            settling: None,
             activity: None,
             ignored: false,
         }
@@ -117,7 +121,8 @@ enum Msg {
         context: Option<String>,
         cached: Option<String>,
     },
-    Summarized { path: PathBuf, result: Result<String, String> },
+    /// `context` is what was summarized, so an answer for changes that have since moved on can be dropped.
+    Summarized { path: PathBuf, context: String, result: Result<String, String> },
     CommitMessage { path: PathBuf, result: Result<String, String> },
     GitDone { path: PathBuf, result: Result<String, String> },
     Activity { path: PathBuf, result: Result<git::Activity, String> },
@@ -220,7 +225,7 @@ impl App {
                 let job = rx.lock().unwrap().recv();
                 let Ok((path, context, force)) = job else { break };
                 let result = ai::summarize(&context, force);
-                if tx.send(Msg::Summarized { path, result }).is_err() {
+                if tx.send(Msg::Summarized { path, context, result }).is_err() {
                     break;
                 }
             });
@@ -441,6 +446,22 @@ impl App {
         if self.auto_summary && still_open && r.context.is_some() && matches!(r.summary, SummaryState::None) {
             self.summarize(i, false);
             self.prefetch_message(i);
+        }
+    }
+
+    /// Summarizes changes the live refresh found once they have stayed the same for `SETTLE`, so an agent that is
+    /// still editing doesn't cause a call per re-check. A failed summary is not retried until the changes move again.
+    fn summarize_settled(&mut self) {
+        const SETTLE: Duration = Duration::from_secs(10);
+        for i in 0..self.repos.len() {
+            if !self.repos[i].settling.is_some_and(|t| t.elapsed() >= SETTLE) {
+                continue;
+            }
+            let r = &mut self.repos[i];
+            r.settling = None;
+            if !r.ignored && r.context.is_some() && matches!(r.summary, SummaryState::None) {
+                self.summarize(i, false);
+            }
         }
     }
 
@@ -687,10 +708,13 @@ impl App {
                 if new_commits && matches!(&self.view, View::Detail { path: p, .. } if *p == path) {
                     self.load_activity(path.clone());
                 }
+                let auto_summary = self.auto_summary;
                 let r = &mut self.repos[i];
                 r.status = Some(status);
                 // A re-check that finds the same changes keeps the summary as it is (a failure message, too).
                 if !quiet || r.context != context {
+                    // New changes found in the background get summarized once they settle; each change restarts the wait.
+                    r.settling = (auto_summary && quiet && context.is_some()).then(Instant::now);
                     r.context = context;
                     match cached {
                         Some(c) => r.summary = SummaryState::Done(c),
@@ -730,13 +754,20 @@ impl App {
                     self.repos[i].activity = Some(result);
                 }
             }
-            Msg::Summarized { path, result } => {
-                if let Some(i) = self.repo_idx(&path) {
-                    self.repos[i].summary = match result {
-                        Ok(t) => SummaryState::Done(t),
-                        Err(e) => SummaryState::Failed(e),
-                    };
+            Msg::Summarized { path, context, result } => {
+                let auto_summary = self.auto_summary;
+                let Some(i) = self.repo_idx(&path) else { return };
+                let r = &mut self.repos[i];
+                // The changes moved on while the AI was working: drop the stale answer and wait for the new ones to settle.
+                if r.context.as_ref() != Some(&context) {
+                    r.summary = SummaryState::None;
+                    r.settling = (auto_summary && r.context.is_some()).then(Instant::now);
+                    return;
                 }
+                r.summary = match result {
+                    Ok(t) => SummaryState::Done(t),
+                    Err(e) => SummaryState::Failed(e),
+                };
             }
         }
     }
@@ -1074,6 +1105,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
         }
         app.refresh_if_due();
         app.summarize_if_lingering();
+        app.summarize_settled();
         let t = app.window_title();
         if t != title {
             let _ = execute!(io::stdout(), SetTitle(&t));

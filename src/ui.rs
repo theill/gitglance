@@ -325,6 +325,7 @@ fn summary_cell(r: &Repo, tick: usize) -> Line<'static> {
         SummaryState::Done(t) => Line::from(ai::headline(t).to_string()),
         SummaryState::Pending => Line::from(format!("{} summarizing…", spin(tick)).magenta()),
         SummaryState::Failed(e) => Line::from(format!("AI failed: {e}").red()),
+        SummaryState::None if r.settling.is_some() => Line::from("summarizing once the changes settle…".dark_gray()),
         SummaryState::None if r.attention() => Line::from("press s to summarize".dark_gray()),
         SummaryState::None => Line::from("clean".dark_gray()),
     }

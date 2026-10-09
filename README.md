@@ -82,7 +82,7 @@ gitglance re-checks every repo every 5 seconds, and runs `git fetch --all` on al
 - `↓N` appears once a fetch sees new commits upstream, so you know to pull.
 - The terminal window title shows the count, like `3 pending · ↓1 · gitglance ~/code`, so you can see it from a tab or taskbar. The title is put back when gitglance quits.
 
-Background re-checks are quiet: no spinners, and they never call the AI. With `--summarize`, only the scans you start (on launch, `r`, `f`) summarize automatically.
+Background re-checks are quiet: no spinners. When one finds new changes in a repo, the AI summarizes them once they have stayed the same for 10 seconds, so an agent that is still editing doesn't cause a call per re-check, and the row says "summarizing once the changes settle…" meanwhile. A summary that comes back for changes that have moved on since is dropped, and the newer changes get their own once they settle. Summaries are cached by content, so a repo that goes back to a state it was in before costs nothing. `--no-auto-summary` turns this off. Repos that already had changes when gitglance started are summarized with `S` or `--summarize`.
 
 ```bash
 gitglance ~/code --interval 10 --fetch-every 15   # gentler
@@ -128,7 +128,7 @@ Ignored repos aren't scanned, so they also make the scan faster.
 
 These run `claude -p` with Haiku and no tools, in a neutral directory. The prompt gets the file list, unpushed commits, the diff (lockfiles left out, capped at 60 KB) and the start of new files. Results are cached in `~/.cache/gitglance`, keyed by that content, so a repo that hasn't changed never costs a second call.
 
-Code only leaves your machine when you ask for it: `s`, `S`, `c`, `--summarize`, or by opening a repo with changes for half a second (turn that off with `--no-auto-summary`). Commit messages are drafted in the background only for repos you've already summarized. Secret-looking files (`.env*`, `*.pem`, `*.key`, `*.p8`, `*.p12`, SSH keys, anything named `credentials` or `secret`) are listed by name, but their contents are never sent.
+Code only leaves your machine when you ask for it: `s`, `S`, `c`, `--summarize`, by opening a repo with changes for half a second, or when the live refresh finds new changes that then stay the same for 10 seconds (turn both off with `--no-auto-summary`). Commit messages are drafted in the background only for repos you've already summarized. Secret-looking files (`.env*`, `*.pem`, `*.key`, `*.p8`, `*.p12`, SSH keys, anything named `credentials` or `secret`) are listed by name, but their contents are never sent.
 
 - `GITGLANCE_MODEL=sonnet` picks another model.
 - `GITGLANCE_AI_CMD='llm -m gpt-4o-mini'` uses any command that reads the prompt on stdin.
