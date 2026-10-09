@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const HELP: &str = "gitglance - overview of pending git changes in every repo below a folder
@@ -39,6 +39,11 @@ that repo, never repos nested below it.
 Press c to commit everything in a repo (Claude drafts the message) and push,
 P to push commits that are already made, or u to pull in commits you are behind on.
 Press t for a shell in the selected repo; exit it to come back.
+
+Press A to start a Claude Code session in the selected repo, or R to resume the last
+one there (claude --continue). It opens in a new terminal window (xdg-terminal-exec,
+$TERMINAL, or Terminal.app on macOS), so gitglance stays live next to it; without a
+desktop it runs right here. Set GITGLANCE_AGENT_CMD to start something other than claude.
 
 AI summaries run `claude -p` (model from GITGLANCE_MODEL, default haiku) and are
 cached in ~/.cache/gitglance. Set GITGLANCE_AI_CMD to use any other command that
@@ -191,8 +196,9 @@ pub struct App {
     pub fetch_every: Option<Duration>,
     last_check: Instant,
     pub last_fetch: Option<Instant>,
-    /// A repo to open a shell in; the run loop does it, since it owns the terminal.
-    shell: Option<PathBuf>,
+    /// A command to hand the terminal to, in a repo (an empty command means `$SHELL`). The run loop does it,
+    /// since it owns the terminal.
+    handoff: Option<(PathBuf, Vec<String>)>,
     /// Summarize a repo's changes once it has been open on the detail page for `LINGER`.
     auto_summary: bool,
     /// The repo whose detail page was just opened, and when; cleared once the linger check ran.
@@ -256,7 +262,7 @@ impl App {
             fetch_every,
             last_check: Instant::now(),
             last_fetch: None,
-            shell: None,
+            handoff: None,
             auto_summary,
             opened: None,
             tx,
@@ -789,6 +795,35 @@ impl App {
         self.view = View::Diff { title, lines, scroll: 0, back: Box::new(back) };
     }
 
+    /// Starts a Claude Code session in the repo (or resumes the last one there) in a new terminal window, so
+    /// gitglance stays live beside it. Without a desktop to open a window on, it runs in this terminal instead.
+    fn open_agent(&mut self, i: usize, resume: bool) {
+        let r = &self.repos[i];
+        let mut cmd: Vec<String> = std::env::var("GITGLANCE_AGENT_CMD")
+            .ok()
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| "claude".into())
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        if !on_path(&cmd[0]) {
+            self.notice = Some(format!("{} is not on your PATH (GITGLANCE_AGENT_CMD picks another command)", cmd[0]));
+            return;
+        }
+        if resume {
+            cmd.push("--continue".into());
+        }
+        let what = if resume { "Resumed the last agent session" } else { "Started an agent session" };
+        self.notice = Some(match launch_in_window(&r.path, &format!("{} · agent", r.name), &cmd) {
+            Ok(true) => format!("{what} for {} in a new window", r.name),
+            Ok(false) => {
+                self.handoff = Some((r.path.clone(), cmd));
+                return;
+            }
+            Err(e) => format!("Could not open a terminal window: {e}"),
+        });
+    }
+
     /// Opens the repo folder in the file manager (Finder on macOS, the default one via xdg-open elsewhere).
     fn open_in_file_manager(&mut self, i: usize) {
         use std::process::{Command, Stdio};
@@ -885,7 +920,12 @@ impl App {
             }
             KeyCode::Char('t') => {
                 if let Some(i) = self.selected_idx() {
-                    self.shell = Some(self.repos[i].path.clone());
+                    self.handoff = Some((self.repos[i].path.clone(), Vec::new()));
+                }
+            }
+            KeyCode::Char('A') | KeyCode::Char('R') => {
+                if let Some(i) = self.selected_idx() {
+                    self.open_agent(i, k.code == KeyCode::Char('R'));
                 }
             }
             KeyCode::Char('r') => self.rescan(false, false),
@@ -1002,7 +1042,12 @@ impl App {
                     self.open_in_file_manager(i);
                 }
             }
-            KeyCode::Char('t') => self.shell = Some(path),
+            KeyCode::Char('t') => self.handoff = Some((path, Vec::new())),
+            KeyCode::Char('A') | KeyCode::Char('R') => {
+                if let Some(i) = self.repo_idx(&path) {
+                    self.open_agent(i, k.code == KeyCode::Char('R'));
+                }
+            }
             KeyCode::Char('r') => self.rescan(false, false),
             _ => {}
         }
@@ -1043,15 +1088,68 @@ fn write_raw(s: &str) {
     let _ = out.flush();
 }
 
-/// Hands the terminal to a shell in `dir` until it exits, then takes it back.
-fn open_shell(terminal: &mut ratatui::DefaultTerminal, dir: &Path) -> io::Result<()> {
+/// Is `prog` a path to a file, or the name of one in a `$PATH` folder?
+fn on_path(prog: &str) -> bool {
+    if prog.contains('/') {
+        return Path::new(prog).is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file()))
+}
+
+/// Runs `cmd` in a new terminal window in `dir`, detached so it outlives gitglance. `Ok(false)` means there is no
+/// desktop or terminal launcher to open a window with.
+fn launch_in_window(dir: &Path, title: &str, cmd: &[String]) -> Result<bool, String> {
+    let mut c = if cfg!(target_os = "macos") {
+        // Terminal.app runs a shell line: single-quote every word for the shell, then escape that for AppleScript.
+        let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+        let args: Vec<String> = cmd.iter().map(|a| quote(a)).collect();
+        let line = format!("cd {} && {}", quote(&dir.to_string_lossy()), args.join(" "));
+        let line = line.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut c = Command::new("osascript");
+        c.args(["-e", &format!("tell application \"Terminal\" to do script \"{line}\"")]);
+        c.args(["-e", "tell application \"Terminal\" to activate"]);
+        c
+    } else {
+        let desktop = ["WAYLAND_DISPLAY", "DISPLAY"].iter().any(|v| std::env::var_os(v).is_some_and(|x| !x.is_empty()));
+        if !desktop {
+            return Ok(false);
+        }
+        if on_path("xdg-terminal-exec") {
+            let mut c = Command::new("xdg-terminal-exec");
+            c.arg(format!("--dir={}", dir.display())).arg(format!("--title={title}")).arg("--").args(cmd);
+            c
+        } else if let Some(t) = std::env::var("TERMINAL").ok().filter(|t| on_path(t)) {
+            let mut c = Command::new(t);
+            c.arg("-e").args(cmd);
+            c
+        } else {
+            return Ok(false);
+        }
+    };
+    // Terminals that ignore --dir start where they were launched from.
+    c.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        // Its own process group, so closing gitglance's terminal doesn't take the agent's window with it.
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
+    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    thread::spawn(move || child.wait());
+    Ok(true)
+}
+
+/// Hands the terminal to `cmd` (`$SHELL` when empty) in `dir` until it exits, then takes it back.
+fn hand_off(terminal: &mut ratatui::DefaultTerminal, dir: &Path, cmd: &[String]) -> io::Result<()> {
     use ratatui::crossterm::{execute, terminal as term};
     ratatui::restore();
     write_raw(POP_TITLE);
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
-    println!("\n  gitglance: shell in {}, exit (or ctrl+d) to go back\n", dir.display());
-    if let Err(e) = Command::new(&shell).current_dir(dir).status() {
-        eprintln!("could not start {shell}: {e}");
+    let shell = [std::env::var("SHELL").unwrap_or_else(|_| "sh".into())];
+    let cmd = if cmd.is_empty() { &shell[..] } else { cmd };
+    let what = if cmd == shell { "shell" } else { cmd[0].as_str() };
+    println!("\n  gitglance: {what} in {}, exit to go back\n", dir.display());
+    if let Err(e) = Command::new(&cmd[0]).args(&cmd[1..]).current_dir(dir).status() {
+        eprintln!("could not start {}: {e}", cmd[0]);
         thread::sleep(Duration::from_secs(2));
     }
     write_raw(PUSH_TITLE);
@@ -1067,8 +1165,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
         while let Ok(msg) = app.rx.try_recv() {
             app.handle(msg);
         }
-        if let Some(dir) = app.shell.take() {
-            open_shell(terminal, &dir)?;
+        if let Some((dir, cmd)) = app.handoff.take() {
+            hand_off(terminal, &dir, &cmd)?;
             title.clear();
             app.spawn_scan(vec![dir], false, false);
         }

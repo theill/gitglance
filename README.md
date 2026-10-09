@@ -53,6 +53,7 @@ AI summaries and drafted commit messages are optional. They need the [Claude Cod
 | `r` / `f` | rescan / `git fetch --all` everywhere, then rescan |
 | `w` | pause or resume the live refresh |
 | `t` | open a shell in the repo (your `$SHELL`); `exit` brings you back |
+| `A` / `R` | start a Claude Code session in the repo / resume the last one there, in a new terminal window (see [Agent sessions](#agent-sessions)) |
 | `o` | open the repo folder in your file manager (Finder on macOS, `xdg-open` on Linux) |
 
 In the detail view, commits you are behind on are listed under **Incoming** (hash, age and subject, up to 50; `d` shows them all). `↑↓` highlights an incoming or unpushed commit or a changed file and `⏎` opens it: a commit as its full `git show`, a file as its diff (or its contents, if it's new). Esc goes back to the same spot. `n`/`p` jumps to the next or previous repo.
@@ -89,6 +90,18 @@ gitglance ~/code --interval 10 --fetch-every 15   # gentler
 gitglance ~/code --fetch-every 0                  # never fetch on its own
 gitglance ~/code --interval 0                     # start paused; w resumes
 ```
+
+## Agent sessions
+
+`A` starts `claude` in the selected repo's folder, so the session works on that repo with its `CLAUDE.md`/`AGENTS.md`. `R` resumes the last conversation there (`claude --continue`). Nothing from gitglance is passed in: the session starts empty, as if you had opened it yourself.
+
+It opens in a new terminal window, so gitglance stays live next to it and shows the agent's changes as they happen. The session keeps running after gitglance quits.
+
+- Linux: `xdg-terminal-exec` (Omarchy's default terminal launcher), otherwise `$TERMINAL -e`.
+- macOS: a new Terminal.app window.
+- No desktop (over SSH, say): it runs in gitglance's own terminal, like `t`, and quitting it brings you back.
+
+`GITGLANCE_AGENT_CMD` starts another command instead (`GITGLANCE_AGENT_CMD='claude --model opus'`); `R` adds `--continue` to it.
 
 ## Commit and push
 
