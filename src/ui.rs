@@ -554,6 +554,25 @@ fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>
         SummaryState::None => lines.push(Line::from("Nothing pending: everything is committed and pushed.".dark_gray())),
     }
 
+    if !s.incoming.is_empty() {
+        let upstream = s.upstream.as_deref().unwrap_or("upstream");
+        section(&mut lines, format!("Incoming from {upstream} ({})", s.behind), "⏎ shows a commit, u pulls them");
+        for c in &s.incoming {
+            let mut parts = c.splitn(3, '\t');
+            let (hash, ts, msg) = (parts.next().unwrap_or(""), parts.next(), parts.next().unwrap_or(""));
+            let age = ts.and_then(|t| t.parse().ok()).map(ago).unwrap_or_default();
+            let selected = sel == Some(items.len());
+            items.push(lines.len());
+            lines.push(item_line(
+                vec![hash.to_string().magenta(), " ".into(), format!("{age:>3} ").dark_gray(), msg.to_string().into()],
+                selected,
+            ));
+        }
+        if s.behind as usize > s.incoming.len() {
+            lines.push(Line::from(format!("  … and {} more (d shows them all)", s.behind as usize - s.incoming.len()).dark_gray()));
+        }
+    }
+
     if s.unpushed_count > 0 {
         section(&mut lines, format!("Unpushed commits ({})", s.unpushed_count), "⏎ shows a commit");
         for c in &s.unpushed {

@@ -130,9 +130,10 @@ pub enum Item {
 }
 
 pub fn detail_items(s: &git::Status) -> Vec<Item> {
-    s.unpushed
+    s.incoming
         .iter()
-        .map(|c| Item::Commit(c.split(' ').next().unwrap_or_default().to_string()))
+        .map(|c| Item::Commit(c.split('\t').next().unwrap_or_default().to_string()))
+        .chain(s.unpushed.iter().map(|c| Item::Commit(c.split(' ').next().unwrap_or_default().to_string())))
         .chain(s.files.iter().cloned().map(Item::File))
         .collect()
 }

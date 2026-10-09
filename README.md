@@ -55,7 +55,7 @@ AI summaries and drafted commit messages are optional. They need the [Claude Cod
 | `t` | open a shell in the repo (your `$SHELL`); `exit` brings you back |
 | `o` | open the repo folder in your file manager (Finder on macOS, `xdg-open` on Linux) |
 
-In the detail view, `↑↓` highlights an unpushed commit or a changed file and `⏎` opens it: a commit as its full `git show`, a file as its diff (or its contents, if it's new). Esc goes back to the same spot. `n`/`p` jumps to the next or previous repo.
+In the detail view, commits you are behind on are listed under **Incoming** (hash, age and subject, up to 50; `d` shows them all). `↑↓` highlights an incoming or unpushed commit or a changed file and `⏎` opens it: a commit as its full `git show`, a file as its diff (or its contents, if it's new). Esc goes back to the same spot. `n`/`p` jumps to the next or previous repo.
 
 A `●` in front of a repo means a background re-check just found it changed (the last minute), and a dim `•` means it changed in the last ten.
 

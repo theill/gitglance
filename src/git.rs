@@ -29,6 +29,8 @@ pub struct Status {
     pub stashes: u32,
     pub unpushed_count: u32,
     pub unpushed: Vec<String>,
+    /// Upstream commits you are behind on, newest first, as `hash<TAB>age<TAB>subject` (at most `INCOMING_MAX`).
+    pub incoming: Vec<String>,
     pub last_commit_ts: Option<i64>,
     pub last_commit_subject: String,
 }
@@ -286,6 +288,12 @@ pub fn status(repo: &Path) -> Result<Status, String> {
             s.has_remote = git(repo, &["remote"]).map(|r| !r.trim().is_empty()).unwrap_or(false);
             s.has_remote.then_some(&["HEAD", "--not", "--remotes"][..])
         };
+        if s.tracking && s.behind > 0 {
+            let max = format!("--max-count={INCOMING_MAX}");
+            if let Ok(out) = git(repo, &["log", &max, "--format=%h%x09%ct%x09%s", "HEAD..@{u}"]) {
+                s.incoming = out.lines().map(String::from).collect();
+            }
+        }
         if let Some(range) = range {
             let mut args = vec!["log", "--format=%h %s"];
             args.extend_from_slice(range);
@@ -298,6 +306,9 @@ pub fn status(repo: &Path) -> Result<Status, String> {
     }
     Ok(s)
 }
+
+/// How many incoming commits the detail page lists; `d` shows them all.
+pub const INCOMING_MAX: usize = 50;
 
 pub fn fetch(repo: &Path) -> Result<String, String> {
     git(repo, &["fetch", "--all", "--prune", "--quiet"])
