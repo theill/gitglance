@@ -155,6 +155,8 @@ pub enum Modal {
         secret_tracked: Vec<String>,
     },
     Confirm { path: PathBuf, title: &'static str, question: String, action: Action },
+    /// Every key, opened with `?`.
+    Help { scroll: u16 },
 }
 
 #[derive(Clone, Copy)]
@@ -621,6 +623,19 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.modal = None,
                 _ => {}
             },
+            Some(Modal::Help { scroll }) => {
+                // The help screen clamps the scroll when it draws, so it never runs past the end.
+                let mut by = |d: i32| *scroll = (*scroll as i32 + d).max(0) as u16;
+                match k.code {
+                    KeyCode::Down | KeyCode::Char('j') => by(1),
+                    KeyCode::Up | KeyCode::Char('k') => by(-1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => by(10),
+                    KeyCode::PageUp => by(-10),
+                    KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => *scroll = u16::MAX,
+                    _ => self.modal = None,
+                }
+            }
             None => {}
         }
     }
@@ -861,6 +876,10 @@ impl App {
                 KeyCode::Char(c) => self.filter.push(c),
                 _ => {}
             }
+            return false;
+        }
+        if k.code == KeyCode::Char('?') {
+            self.modal = Some(Modal::Help { scroll: 0 });
             return false;
         }
         match self.view {

@@ -66,7 +66,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     footer(f, foot, app);
 }
 
-fn modal(f: &mut Frame, area: Rect, app: &App) {
+fn modal(f: &mut Frame, area: Rect, app: &mut App) {
+    if let Some(Modal::Help { scroll }) = &mut app.modal {
+        *scroll = help(f, area, *scroll);
+        return;
+    }
+    let app = &*app;
     let Some(m) = &app.modal else { return };
     let width = area.width.saturating_sub(4).min(96);
     let inner_w = width.saturating_sub(4).max(1) as usize;
@@ -111,6 +116,7 @@ fn modal(f: &mut Frame, area: Rect, app: &App) {
             });
             (" Commit ", lines)
         }
+        Modal::Help { .. } => return,
         Modal::Confirm { title, question, .. } => {
             let mut lines = vec![Line::raw("")];
             lines.extend(question.split('\n').map(|l| Line::from(l.to_string().bold())));
@@ -181,6 +187,109 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Line::from(spans), area);
 }
 
+/// Everything on the help screen, in sections of (keys, what they do). The footer only shows the everyday ones.
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Repo list",
+        &[
+            ("↑↓ j k", "move  (g/G top/bottom, PgUp/PgDn)"),
+            ("⏎", "open the repo's details"),
+            ("s / S", "AI summary for this repo / all listed"),
+            ("c", "commit everything and push (AI drafts it)"),
+            ("P", "push commits that are already made"),
+            ("u", "pull: fast-forward, or rebase if diverged"),
+            ("d", "everything pending as one diff"),
+            ("A / R", "new / resume Claude Code session here"),
+            ("t", "shell in the repo, exit to come back"),
+            ("o", "open the folder in your file manager"),
+            ("f / r", "fetch every repo / rescan"),
+            ("w", "pause or resume the live refresh"),
+            ("a", "repos with changes ↔ all repos"),
+            ("/", "filter by name"),
+            ("x / I", "ignore or un-ignore / show ignored"),
+            ("q  esc", "quit"),
+        ],
+    ),
+    (
+        "Repo details",
+        &[
+            ("↑↓", "highlight a commit or file"),
+            ("⏎", "open it: git show, or the file's diff"),
+            ("n / p", "next / previous repo"),
+            ("s", "regenerate the AI summary"),
+            ("c P u d", "commit, push, pull, diff"),
+            ("A R t o", "agent, resume, shell, folder"),
+            ("esc  ←", "back to the list"),
+        ],
+    ),
+    ("Diff", &[("↑↓  space", "scroll, page"), ("g / G", "top / bottom"), ("esc", "back")]),
+    (
+        "Commit box",
+        &[
+            ("⏎", "commit (and push)"),
+            ("tab", "push on or off"),
+            ("ctrl+g", "new AI message"),
+            ("ctrl+u", "clear"),
+            ("alt+⏎", "new line"),
+            ("esc", "cancel"),
+        ],
+    ),
+    (
+        "Symbols",
+        &[
+            ("●  •", "changed in the last minute / ten minutes"),
+            ("S M ? U", "staged, modified, untracked, conflicts"),
+            ("≡", "stashes"),
+            ("↑N ↓N", "commits to push / to pull"),
+            ("✓", "in sync with its upstream"),
+        ],
+    ),
+];
+
+fn help_section(lines: &mut Vec<Line<'static>>, title: &str, keys: &[(&str, &str)]) {
+    if !lines.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(title.to_string().cyan().bold()));
+    for (k, what) in keys {
+        lines.push(Line::from(vec![format!("  {k:<11}").yellow().bold(), what.to_string().into()]));
+    }
+}
+
+/// The help screen; two columns when there is room. Returns the scroll, clamped to the content.
+fn help(f: &mut Frame, area: Rect, scroll: u16) -> u16 {
+    let two = area.width >= 110;
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    // Two columns of about equal height: the list and diff keys left, the rest right.
+    for (i, (title, keys)) in HELP.iter().enumerate() {
+        let side = if two && ![0, 2].contains(&i) { &mut right } else { &mut left };
+        help_section(side, title, keys);
+    }
+    let width = if two { area.width.saturating_sub(4).min(124) } else { area.width.saturating_sub(2).min(72) };
+    let rows = left.len().max(right.len()) as u16;
+    let height = (rows + 3).min(area.height);
+    let scroll = scroll.min((rows + 3).saturating_sub(height));
+    let rect = Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height - height) / 2, width, height };
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .title(" Keys ".bold())
+        .title_bottom(Line::from(" any key closes ".dark_gray()).right_aligned())
+        .border_style(Style::new().cyan())
+        .padding(Padding::new(2, 2, 1, 0));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let cols = if two {
+        Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).spacing(4).split(inner).to_vec()
+    } else {
+        vec![inner]
+    };
+    f.render_widget(Paragraph::new(left).scroll((scroll, 0)), cols[0]);
+    if two {
+        f.render_widget(Paragraph::new(right).scroll((scroll, 0)), cols[1]);
+    }
+    scroll
+}
+
 fn footer(f: &mut Frame, area: Rect, app: &App) {
     if let Some(n) = &app.notice {
         f.render_widget(Line::from(format!(" {n}").yellow()), area);
@@ -203,44 +312,31 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("alt+⏎", "newline"),
             ("esc", "cancel"),
         ],
+        _ if matches!(app.modal, Some(Modal::Help { .. })) => &[("↑↓", "scroll"), ("any other key", "closes")],
         _ if app.modal.is_some() => &[("y/⏎", "yes"), ("n/esc", "cancel")],
         _ if app.filtering => &[("type", "filter"), ("⏎", "done"), ("esc", "clear")],
+        // The everyday keys only; ? lists them all.
         View::List => &[
-            ("↑↓", "move"),
             ("⏎", "details"),
-            ("s", "summarize"),
-            ("S", "summarize all"),
             ("c", "commit"),
             ("P", "push"),
             ("u", "pull"),
             ("d", "diff"),
-            ("a", "all/changed"),
-            ("x", "ignore"),
-            ("I", "show ignored"),
-            ("/", "filter"),
-            ("t", "shell"),
-            ("A/R", "new/resume agent"),
-            ("r", "refresh"),
-            ("f", "fetch"),
+            ("A", "agent"),
+            ("?", "all keys"),
             ("q", "quit"),
         ],
         View::Detail { .. } => &[
             ("esc", "back"),
-            ("↑↓", "select"),
             ("⏎", "open"),
-            ("n/p", "next/prev repo"),
-            ("s", "re-summarize"),
+            ("n/p", "next/prev"),
             ("c", "commit"),
             ("P", "push"),
             ("u", "pull"),
-            ("d", "diff"),
-            ("t", "shell"),
-            ("A/R", "new/resume agent"),
-            ("o", "open folder"),
-            ("r", "refresh"),
-            ("q", "quit"),
+            ("A", "agent"),
+            ("?", "all keys"),
         ],
-        View::Diff { .. } => &[("esc", "back"), ("↑↓", "scroll"), ("space", "page"), ("g/G", "top/bottom"), ("q", "quit")],
+        View::Diff { .. } => &[("esc", "back"), ("↑↓", "scroll"), ("space", "page"), ("?", "all keys")],
     };
     let mut spans = vec![Span::raw(" ")];
     for (k, label) in keys {

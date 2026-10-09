@@ -39,6 +39,7 @@ AI summaries and drafted commit messages are optional. They need the [Claude Cod
 
 | List | |
 |---|---|
+| `?` | every key on one screen (the footer only shows the everyday ones) |
 | `↑↓` `j/k` | move |
 | `⏎` | details: AI summary, unpushed commits, changed files with +/-, and commit activity (see [Repo details](#repo-details)) |
 | `s` / `S` | AI summary for this repo / for every listed repo without one |
