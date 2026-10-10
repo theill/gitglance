@@ -130,7 +130,7 @@ Uncommitted changes are stashed for the pull and restored afterwards.
 
 Press `U` (Shift+U) in the list or detail view to sync every non-ignored repository in the scanned folder, including repos hidden by a filter or by the changes-only view. It discovers new repos first and waits for current scans and Git operations to finish.
 
-The batch runs in the background, with progress in the header. Each repo fetches all remotes and fast-forwards its current branch from its upstream if needed. Local commits stay unpushed. Local changes stay uncommitted, and syncing never asks the AI.
+The batch runs in the background, with progress in the header. Each repo fetches all remotes and fast-forwards its current branch from its upstream if needed. Local commits stay unpushed. Local changes stay uncommitted. Your live AI-summary settings still apply when repo status changes.
 
 Repos with diverged branches, conflicts, an unfinished Git operation, a missing upstream, or local edits that would need to be stashed before pulling are skipped. Use `u` for a diverged branch, or commit/stash edits, then sync again. Repos with no remote, no commits, or detached HEAD are also skipped. A failure in one repo doesn't stop the rest.
 
