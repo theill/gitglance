@@ -132,14 +132,7 @@ pub fn pull(repo: &Path, rebase: bool) -> Result<(), String> {
 }
 
 fn rebase_in_progress(repo: &Path) -> bool {
-    ["rebase-merge", "rebase-apply"].iter().any(|dir| {
-        git(repo, &["rev-parse", "--git-path", dir])
-            .map(|p| {
-                let p = PathBuf::from(p.trim());
-                if p.is_relative() { repo.join(p) } else { p }.exists()
-            })
-            .unwrap_or(false)
-    })
+    ["rebase-merge", "rebase-apply"].iter().any(|dir| git_path_exists(repo, dir))
 }
 
 /// Pushes the current branch, setting an upstream on first push.
@@ -312,6 +305,64 @@ pub const INCOMING_MAX: usize = 50;
 
 pub fn fetch(repo: &Path) -> Result<String, String> {
     git(repo, &["fetch", "--all", "--prune", "--quiet"])
+}
+
+pub enum SyncOutcome {
+    Updated(String),
+    UpToDate,
+    Skipped(String),
+}
+
+/// Fetch and fast-forward the current branch without committing edits or rebasing unattended.
+pub fn sync(repo: &Path) -> Result<SyncOutcome, String> {
+    let s = status(repo)?;
+    if s.initial {
+        return Ok(SyncOutcome::Skipped("no commits yet".into()));
+    }
+    if !s.has_remote {
+        return Ok(SyncOutcome::Skipped("no remote".into()));
+    }
+    if s.branch == "(detached)" {
+        return Ok(SyncOutcome::Skipped("detached HEAD".into()));
+    }
+    let in_progress = ["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer"]
+        .iter()
+        .any(|name| git_path_exists(repo, name));
+    if s.conflicts > 0 || in_progress {
+        return Ok(SyncOutcome::Skipped("resolve the current Git operation or conflicts first".into()));
+    }
+    fetch(repo).map_err(|e| format!("fetch failed: {e}"))?;
+    // The dashboard's ahead/behind counts can be stale until the fetch completes.
+    let s = status(repo)?;
+    if !s.tracking && s.upstream.is_some() {
+        return Ok(SyncOutcome::Skipped("upstream no longer exists; choose an upstream first".into()));
+    }
+    if !s.tracking {
+        return Ok(SyncOutcome::Skipped("no upstream to pull from".into()));
+    }
+    if s.ahead > 0 && s.behind > 0 {
+        return Ok(SyncOutcome::Skipped("branch has diverged; use u to rebase, then sync again".into()));
+    }
+    if s.behind > 0 && s.dirty() {
+        return Ok(SyncOutcome::Skipped("commit or stash local changes before pulling".into()));
+    }
+    let mut updated = Vec::new();
+    if s.behind > 0 {
+        // Integrate the upstream we just fetched. No second fetch or automatic stash is needed.
+        git(repo, &["merge", "--ff-only", "--quiet", "@{u}"])
+            .map_err(|e| format!("fast-forward failed: {e}"))?;
+        updated.push(format!("pulled {} commit{}", s.behind, if s.behind == 1 { "" } else { "s" }));
+    }
+    Ok(if updated.is_empty() { SyncOutcome::UpToDate } else { SyncOutcome::Updated(updated.join("; ")) })
+}
+
+fn git_path_exists(repo: &Path, name: &str) -> bool {
+    git(repo, &["rev-parse", "--git-path", name])
+        .map(|p| {
+            let p = PathBuf::from(p.trim());
+            if p.is_relative() { repo.join(p) } else { p }.exists()
+        })
+        .unwrap_or(false)
 }
 
 const LOG_PATCH: [&str; 7] =
@@ -606,8 +657,135 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct TestDir(pub PathBuf);
+
+    impl TestDir {
+        pub fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!("gitglance-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn setup() -> (TestDir, PathBuf, PathBuf, PathBuf) {
+        let dir = TestDir::new();
+        let remote = dir.0.join("remote.git");
+        git(&dir.0, &["init", "--bare", "--initial-branch=main", remote.to_str().unwrap()]).unwrap();
+        let local = dir.0.join("local");
+        let peer = dir.0.join("peer");
+        git(&dir.0, &["clone", remote.to_str().unwrap(), local.to_str().unwrap()]).unwrap();
+        commit(&local, "base", "base");
+        git(&local, &["push", "--set-upstream", "origin", "main"]).unwrap();
+        git(&dir.0, &["clone", remote.to_str().unwrap(), peer.to_str().unwrap()]).unwrap();
+        (dir, remote, local, peer)
+    }
+
+    fn commit(repo: &Path, file: &str, content: &str) {
+        std::fs::write(repo.join(file), content).unwrap();
+        git(repo, &["add", "--", file]).unwrap();
+        git(repo, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-m", content]).unwrap();
+    }
+
+    fn head(repo: &Path) -> String {
+        git(repo, &["rev-parse", "HEAD"]).unwrap()
+    }
+
+    #[test]
+    fn sync_fetches_before_fast_forwarding_and_is_idempotent() {
+        let (_dir, _, local, peer) = setup();
+        commit(&peer, "incoming", "incoming");
+        git(&peer, &["push"]).unwrap();
+        assert_eq!(status(&local).unwrap().behind, 0, "counts are stale before fetch");
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Updated(_)));
+        assert_eq!(head(&local), head(&peer));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::UpToDate));
+    }
+
+    #[test]
+    fn sync_leaves_local_commits_unpushed_and_preserves_staged_and_untracked_edits() {
+        let (_dir, remote, local, _) = setup();
+        let remote_head = head(&remote);
+        commit(&local, "outgoing", "outgoing");
+        std::fs::write(local.join("base"), "uncommitted").unwrap();
+        git(&local, &["add", "base"]).unwrap();
+        std::fs::write(local.join("untracked"), "untracked").unwrap();
+        let before = git(&local, &["status", "--porcelain"]).unwrap();
+        let local_head = head(&local);
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::UpToDate));
+        assert_eq!(head(&remote), remote_head);
+        assert_eq!(head(&local), local_head);
+        assert_eq!(git(&local, &["status", "--porcelain"]).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(local.join("base")).unwrap(), "uncommitted");
+    }
+
+    #[test]
+    fn sync_skips_diverged_branches_without_rewriting_commits() {
+        let (_dir, remote, local, peer) = setup();
+        commit(&local, "outgoing", "outgoing");
+        commit(&peer, "incoming", "incoming");
+        git(&peer, &["push"]).unwrap();
+        let (local_head, remote_head) = (head(&local), head(&remote));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("diverged")));
+        assert_eq!(head(&local), local_head);
+        assert_eq!(head(&remote), remote_head);
+        assert!(!rebase_in_progress(&local));
+    }
+
+    #[test]
+    fn sync_skips_dirty_incoming_repos_and_preserves_edits() {
+        let (_dir, _, local, peer) = setup();
+        commit(&peer, "base", "remote edit");
+        git(&peer, &["push"]).unwrap();
+        std::fs::write(local.join("base"), "local edit").unwrap();
+        let before = head(&local);
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("local changes")));
+        assert_eq!(head(&local), before);
+        assert_eq!(std::fs::read_to_string(local.join("base")).unwrap(), "local edit");
+        assert_eq!(status(&local).unwrap().stashes, 0);
+    }
+
+    #[test]
+    fn sync_skips_branches_without_an_upstream_and_deleted_upstreams() {
+        let (_dir, remote, local, peer) = setup();
+        git(&local, &["checkout", "-b", "feature"]).unwrap();
+        commit(&local, "feature", "feature");
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("no upstream")));
+        assert!(status(&local).unwrap().upstream.is_none());
+        assert!(git(&remote, &["rev-parse", "--verify", "refs/heads/feature"]).is_err());
+        git(&local, &["push", "--set-upstream", "origin", "feature"]).unwrap();
+        git(&peer, &["push", "origin", "--delete", "feature"]).unwrap();
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("upstream no longer exists")));
+        assert!(git(&remote, &["rev-parse", "--verify", "refs/heads/feature"]).is_err());
+    }
+
+    #[test]
+    fn sync_reports_fetch_failures() {
+        let (dir, _, local, _) = setup();
+        commit(&local, "outgoing", "outgoing");
+        git(&local, &["remote", "set-url", "origin", dir.0.join("missing.git").to_str().unwrap()]).unwrap();
+        assert!(sync(&local).err().unwrap().contains("fetch failed"));
+    }
+
+    #[test]
+    fn sync_skips_detached_and_in_progress_repos() {
+        let (_dir, _, local, _) = setup();
+        git(&local, &["checkout", "--detach"]).unwrap();
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("detached")));
+        git(&local, &["checkout", "main"]).unwrap();
+        std::fs::create_dir(local.join(".git/rebase-merge")).unwrap();
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("current Git operation")));
+    }
 
     #[test]
     fn dates_round_trip() {

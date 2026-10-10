@@ -45,6 +45,7 @@ AI summaries and drafted commit messages are optional. They need the [Claude Cod
 | `c` | commit everything and push (see below) |
 | `P` | push commits that are already made (asks first) |
 | `u` | pull commits you're behind on (see below) |
+| `U` (Shift+U) | sync every non-ignored repo: fetch and pull updates (fast-forward only) |
 | `d` | everything pending: uncommitted diff, unpushed commits with patches, incoming commits |
 | `a` | toggle repos with changes ↔ all repos |
 | `/` | filter by name |
@@ -110,6 +111,16 @@ gitglance ~/code --interval 0                     # start paused; w resumes
 - **Diverged** (`↑2 ↓1`): `u` asks, then rebases your local commits on top (`git pull --rebase --autostash`). Push afterwards with `P`. If the rebase hits a conflict, it's aborted automatically and nothing changes; the message tells you the command to run by hand.
 
 Uncommitted changes are stashed for the pull and restored afterwards.
+
+## Syncing every repo (`U`)
+
+Press `U` (Shift+U) in the list or detail view to sync every non-ignored repository in the scanned folder, including repos hidden by a filter or by the changes-only view. It discovers new repos first and waits for current scans and Git operations to finish.
+
+The batch runs in the background, with progress in the header. Each repo fetches all remotes and fast-forwards its current branch from its upstream if needed. Local commits stay unpushed. Local changes stay uncommitted, and syncing never asks the AI.
+
+Repos with diverged branches, conflicts, an unfinished Git operation, a missing upstream, or local edits that would need to be stashed before pulling are skipped. Use `u` for a diverged branch, or commit/stash edits, then sync again. Repos with no remote, no commits, or detached HEAD are also skipped. A failure in one repo doesn't stop the rest.
+
+When the batch finishes, a scrollable results view lists each repo's outcome and any errors. Esc returns to your previous view.
 
 ## Ignoring repos
 

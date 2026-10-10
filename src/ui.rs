@@ -155,7 +155,11 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
     if ignored > 0 {
         spans.push(format!(" · {ignored} ignored").dark_gray());
     }
-    if busy > 0 {
+    if let Some(progress) = &app.syncing {
+        spans.push(format!("   {} syncing {}/{}", spin(app.tick), progress.done, progress.total).cyan());
+    } else if app.sync_requested {
+        spans.push("   sync queued".cyan());
+    } else if busy > 0 {
         spans.push(format!("   {} scanning {busy}", spin(app.tick)).cyan());
     }
     if thinking > 0 {
@@ -213,6 +217,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("c", "commit"),
             ("P", "push"),
             ("u", "pull"),
+            ("U", "sync all"),
             ("d", "diff"),
             ("a", "all/changed"),
             ("x", "ignore"),
@@ -232,6 +237,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("c", "commit"),
             ("P", "push"),
             ("u", "pull"),
+            ("U", "sync all"),
             ("d", "diff"),
             ("t", "shell"),
             ("o", "open folder"),

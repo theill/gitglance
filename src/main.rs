@@ -38,6 +38,7 @@ that repo, never repos nested below it.
 
 Press c to commit everything in a repo (Claude drafts the message) and push,
 P to push commits that are already made, or u to pull in commits you are behind on.
+Press U (shift+u) to fetch and pull updates in every non-ignored repo.
 Press t for a shell in the selected repo; exit it to come back.
 
 AI summaries run `claude -p` (model from GITGLANCE_MODEL, default haiku) and are
@@ -120,6 +121,7 @@ enum Msg {
     Summarized { path: PathBuf, result: Result<String, String> },
     CommitMessage { path: PathBuf, result: Result<String, String> },
     GitDone { path: PathBuf, result: Result<String, String> },
+    Synced { path: PathBuf, result: Result<git::SyncOutcome, String> },
     Activity { path: PathBuf, result: Result<git::Activity, String> },
 }
 
@@ -165,6 +167,23 @@ pub enum View {
     Diff { title: String, lines: Vec<String>, scroll: u16, back: Box<View> },
 }
 
+#[derive(Default)]
+pub struct SyncProgress {
+    pub total: usize,
+    pub done: usize,
+    updated: usize,
+    unchanged: usize,
+    skipped: usize,
+    failed: usize,
+    results: Vec<(String, String)>,
+}
+
+impl SyncProgress {
+    fn summary(&self) -> String {
+        format!("Sync: {} updated, {} up to date, {} skipped, {} failed", self.updated, self.unchanged, self.skipped, self.failed)
+    }
+}
+
 pub struct App {
     pub root: PathBuf,
     pub root_display: String,
@@ -185,6 +204,10 @@ pub struct App {
     drafting: HashSet<PathBuf>,
     pub tick: usize,
     pub notice: Option<String>,
+    pub sync_requested: bool,
+    pub syncing: Option<SyncProgress>,
+    /// Track Git writes separately from scans to keep operations from overlapping.
+    operating: HashSet<PathBuf>,
     /// Live mode: re-check every repo every `interval`, and fetch every `fetch_every`.
     pub live: bool,
     interval: Duration,
@@ -251,6 +274,9 @@ impl App {
             drafting: HashSet::new(),
             tick: 0,
             notice: None,
+            sync_requested: false,
+            syncing: None,
+            operating: HashSet::new(),
             live: !interval.is_zero(),
             interval: if interval.is_zero() { Duration::from_secs(5) } else { interval },
             fetch_every,
@@ -311,6 +337,9 @@ impl App {
 
     /// A quiet rescan is the live refresh: no spinners, no notice, and it skips repos that are already being scanned.
     fn rescan(&mut self, fetch: bool, quiet: bool) {
+        if self.syncing.is_some() {
+            return;
+        }
         self.last_check = Instant::now();
         if fetch {
             self.last_fetch = Some(Instant::now());
@@ -327,7 +356,7 @@ impl App {
         let paths: Vec<PathBuf> = self
             .repos
             .iter()
-            .filter(|r| !r.ignored && !(quiet && (r.busy || r.checking)))
+            .filter(|r| !r.ignored && !self.operating.contains(&r.path) && !(quiet && (r.busy || r.checking)))
             .map(|r| r.path.clone())
             .collect();
         self.spawn_scan(paths, fetch, quiet);
@@ -336,7 +365,7 @@ impl App {
     fn spawn_scan(&mut self, paths: Vec<PathBuf>, fetch: bool, quiet: bool) {
         let mut jobs = Vec::new();
         for r in &mut self.repos {
-            if paths.contains(&r.path) {
+            if paths.contains(&r.path) && !self.operating.contains(&r.path) {
                 r.gen += 1;
                 if quiet {
                     r.checking = true;
@@ -445,6 +474,9 @@ impl App {
     }
 
     fn open_commit(&mut self, i: usize) {
+        if self.operation_blocked(&self.repos[i].path.clone()) {
+            return;
+        }
         let r = &self.repos[i];
         let Some(Ok(s)) = &r.status else { return };
         if !s.dirty() {
@@ -524,6 +556,9 @@ impl App {
     }
 
     fn confirm_push(&mut self, i: usize) {
+        if self.operation_blocked(&self.repos[i].path.clone()) {
+            return;
+        }
         let r = &self.repos[i];
         let Some(Ok(s)) = &r.status else { return };
         if s.unpushed_count == 0 {
@@ -540,6 +575,9 @@ impl App {
     }
 
     fn update(&mut self, i: usize) {
+        if self.operation_blocked(&self.repos[i].path.clone()) {
+            return;
+        }
         let r = &self.repos[i];
         let Some(Ok(s)) = &r.status else { return };
         if !s.tracking {
@@ -572,14 +610,106 @@ impl App {
 
     /// Runs a git operation off the UI thread, then rescans the repo.
     fn start_op(&mut self, path: PathBuf, op: impl FnOnce(&Path) -> Result<String, String> + Send + 'static) {
+        if self.operation_blocked(&path) {
+            return;
+        }
+        self.operating.insert(path.clone());
         if let Some(i) = self.repo_idx(&path) {
-            self.repos[i].busy = true;
+            let r = &mut self.repos[i];
+            // Discard any earlier scan result so it can't clear the operation's busy flag.
+            r.gen += 1;
+            r.checking = false;
+            r.busy = true;
         }
         let tx = self.tx.clone();
         thread::spawn(move || {
             let result = op(&path);
             let _ = tx.send(Msg::GitDone { path, result });
         });
+    }
+
+    fn operation_blocked(&mut self, path: &Path) -> bool {
+        if self.sync_requested || self.syncing.is_some() || self.operating.contains(path) {
+            self.notice = Some("A Git operation is already running; wait for it to finish".into());
+            return true;
+        }
+        false
+    }
+
+    fn sync_all(&mut self) {
+        if self.sync_requested || self.syncing.is_some() {
+            self.notice = Some("Sync is already running".into());
+            return;
+        }
+        // Discover new repos and reload ignores before choosing the batch; filters don't limit it.
+        self.rescan(false, true);
+        self.sync_requested = true;
+        self.notice = Some("Sync queued; waiting for current scans and Git operations…".into());
+        self.start_sync_if_ready();
+    }
+
+    fn start_sync_if_ready(&mut self) {
+        if !self.sync_requested || !self.operating.is_empty() || self.repos.iter().any(|r| r.busy || r.checking) {
+            return;
+        }
+        self.sync_requested = false;
+        let paths: Vec<_> = self.repos.iter().filter(|r| !r.ignored).map(|r| r.path.clone()).collect();
+        if paths.is_empty() {
+            self.notice = Some("No non-ignored repositories to sync".into());
+            return;
+        }
+        for r in &mut self.repos {
+            if !r.ignored {
+                r.busy = true;
+                self.operating.insert(r.path.clone());
+            }
+        }
+        self.syncing = Some(SyncProgress { total: paths.len(), ..Default::default() });
+        self.notice = None;
+        let workers = 8.min(paths.len());
+        let jobs = Arc::new(Mutex::new(paths.into_iter().rev().collect::<Vec<_>>()));
+        for _ in 0..workers {
+            let (jobs, tx) = (jobs.clone(), self.tx.clone());
+            thread::spawn(move || loop {
+                let Some(path) = jobs.lock().unwrap().pop() else { break };
+                let result = git::sync(&path);
+                if tx.send(Msg::Synced { path, result }).is_err() {
+                    break;
+                }
+            });
+        }
+    }
+
+    fn sync_done(&mut self, path: PathBuf, result: Result<git::SyncOutcome, String>) {
+        self.operating.remove(&path);
+        let name = self.repo_idx(&path).map(|i| self.repos[i].name.clone()).unwrap_or_else(|| path.display().to_string());
+        if let Some(progress) = &mut self.syncing {
+            let message = match result {
+                Ok(git::SyncOutcome::Updated(m)) => { progress.updated += 1; format!("UPDATED: {m}") }
+                Ok(git::SyncOutcome::UpToDate) => { progress.unchanged += 1; "UP TO DATE".into() }
+                Ok(git::SyncOutcome::Skipped(m)) => { progress.skipped += 1; format!("SKIPPED: {m}") }
+                Err(e) => { progress.failed += 1; format!("FAILED: {e}") }
+            };
+            progress.done += 1;
+            progress.results.push((name, message));
+            if progress.done == progress.total {
+                let mut progress = self.syncing.take().unwrap();
+                let summary = progress.summary();
+                progress.results.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut lines = vec![summary.clone(), String::new()];
+                for (name, message) in progress.results {
+                    lines.push(name);
+                    lines.push(format!("  {message}"));
+                    lines.push(String::new());
+                }
+                let back = Box::new(std::mem::replace(&mut self.view, View::List));
+                self.view = View::Diff { title: "Sync all repositories".into(), lines, scroll: 0, back };
+                self.notice = Some(summary);
+                self.last_fetch = Some(Instant::now());
+            }
+        }
+        // Refresh quietly so bulk sync doesn't trigger AI summaries.
+        self.spawn_scan(vec![path], false, true);
     }
 
     fn modal_key(&mut self, k: KeyEvent) {
@@ -622,6 +752,10 @@ impl App {
     /// Live mode: quietly re-checks every repo, and fetches now and then, so work done in other sessions shows up
     /// without a key press. The first fetch waits for the startup scan, so the list appears right away.
     fn refresh_if_due(&mut self) {
+        self.start_sync_if_ready();
+        if self.sync_requested || self.syncing.is_some() {
+            return;
+        }
         if !self.live {
             return;
         }
@@ -718,6 +852,7 @@ impl App {
                 }
             }
             Msg::GitDone { path, result } => {
+                self.operating.remove(&path);
                 let name = self.repo_idx(&path).map(|i| self.repos[i].name.clone()).unwrap_or_default();
                 self.notice = Some(match result {
                     Ok(m) => format!("{name}: {m} ✓"),
@@ -725,6 +860,7 @@ impl App {
                 });
                 self.spawn_scan(vec![path], false, false);
             }
+            Msg::Synced { path, result } => self.sync_done(path, result),
             Msg::Activity { path, result } => {
                 if let Some(i) = self.repo_idx(&path) {
                     self.repos[i].activity = Some(result);
@@ -826,6 +962,10 @@ impl App {
                 KeyCode::Char(c) => self.filter.push(c),
                 _ => {}
             }
+            return false;
+        }
+        if k.code == KeyCode::Char('U') {
+            self.sync_all();
             return false;
         }
         match self.view {
@@ -1135,4 +1275,57 @@ fn main() -> io::Result<()> {
     ratatui::restore();
     write_raw(POP_TITLE);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_shortcut_covers_hidden_repos_honors_ignores_and_continues_after_errors() {
+        let dir = git::tests::TestDir::new();
+        for name in ["hidden", "ignored", "broken"] {
+            let path = dir.0.join(name);
+            git::git(&dir.0, &["init", "--initial-branch=main", path.to_str().unwrap()]).unwrap();
+            git::git(&path, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "initial"]).unwrap();
+            if name != "hidden" {
+                git::git(&path, &["remote", "add", "origin", dir.0.join("missing.git").to_str().unwrap()]).unwrap();
+            }
+        }
+        std::fs::write(dir.0.join(ignore::FILE_NAME), "ignored\n").unwrap();
+        let mut app = App::new(dir.0.clone(), 2, false, false, Duration::ZERO, None);
+        app.rescan(false, false);
+        app.filter = "broken".into();
+        let key = KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT);
+        assert!(!app.on_key(key));
+        assert!(app.sync_requested, "sync waits for the startup scan");
+        assert!(!app.on_key(key));
+        assert!(app.notice.as_deref().unwrap().contains("already running"));
+        // Check that a per-repo write can't race the queued batch.
+        app.start_op(dir.0.join("hidden"), |_| panic!("overlapping operation must not start"));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            app.refresh_if_due();
+            if !app.sync_requested && app.syncing.is_none() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sync did not finish");
+            if let Ok(msg) = app.rx.recv_timeout(Duration::from_millis(100)) {
+                app.handle(msg);
+            }
+        }
+        let View::Diff { lines, .. } = &app.view else { panic!("expected results view") };
+        let report = lines.join("\n");
+        assert!(report.contains("1 skipped, 1 failed"), "{report}");
+        assert!(report.contains("hidden\n  SKIPPED: no remote"), "{report}");
+        assert!(report.contains("broken\n  FAILED: fetch failed"), "{report}");
+        assert!(!report.contains("ignored"), "{report}");
+        assert!(app.operating.is_empty());
+        // Let the final status refresh finish before the temporary repos are removed.
+        while app.repos.iter().any(|r| r.busy || r.checking) {
+            app.handle(app.rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.view, View::List));
+    }
 }
