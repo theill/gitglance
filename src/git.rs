@@ -308,7 +308,8 @@ pub fn fetch(repo: &Path) -> Result<String, String> {
 }
 
 pub enum SyncOutcome {
-    Updated(String),
+    /// Fast-forwarded over `count` commits; `commits` holds the newest of them, formatted like `Status::incoming`.
+    Updated { count: u32, commits: Vec<String> },
     UpToDate,
     Skipped(String),
 }
@@ -346,14 +347,12 @@ pub fn sync(repo: &Path) -> Result<SyncOutcome, String> {
     if s.behind > 0 && s.dirty() {
         return Ok(SyncOutcome::Skipped("commit or stash local changes before pulling".into()));
     }
-    let mut updated = Vec::new();
-    if s.behind > 0 {
-        // Integrate the upstream we just fetched. No second fetch or automatic stash is needed.
-        git(repo, &["merge", "--ff-only", "--quiet", "@{u}"])
-            .map_err(|e| format!("fast-forward failed: {e}"))?;
-        updated.push(format!("pulled {} commit{}", s.behind, if s.behind == 1 { "" } else { "s" }));
+    if s.behind == 0 {
+        return Ok(SyncOutcome::UpToDate);
     }
-    Ok(if updated.is_empty() { SyncOutcome::UpToDate } else { SyncOutcome::Updated(updated.join("; ")) })
+    // Integrate the upstream we just fetched. No second fetch or automatic stash is needed.
+    git(repo, &["merge", "--ff-only", "--quiet", "@{u}"]).map_err(|e| format!("fast-forward failed: {e}"))?;
+    Ok(SyncOutcome::Updated { count: s.behind, commits: s.incoming })
 }
 
 fn git_path_exists(repo: &Path, name: &str) -> bool {
@@ -707,7 +706,7 @@ pub(crate) mod tests {
         commit(&peer, "incoming", "incoming");
         git(&peer, &["push"]).unwrap();
         assert_eq!(status(&local).unwrap().behind, 0, "counts are stale before fetch");
-        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Updated(_)));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Updated { count: 1, commits } if commits[0].ends_with("\tincoming")));
         assert_eq!(head(&local), head(&peer));
         assert!(matches!(sync(&local).unwrap(), SyncOutcome::UpToDate));
     }

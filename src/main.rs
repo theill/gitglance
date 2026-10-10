@@ -165,22 +165,66 @@ pub enum View {
     /// `sel` indexes `detail_items`; `None` means nothing is highlighted yet.
     Detail { path: PathBuf, scroll: u16, sel: Option<usize> },
     Diff { title: String, lines: Vec<String>, scroll: u16, back: Box<View> },
+    /// The report wraps to the terminal width, so drawing it clamps `scroll`.
+    Sync { report: SyncReport, scroll: u16, back: Box<View> },
 }
 
-#[derive(Default)]
 pub struct SyncProgress {
     pub total: usize,
-    pub done: usize,
-    updated: usize,
-    unchanged: usize,
-    skipped: usize,
-    failed: usize,
-    results: Vec<(String, String)>,
+    started: Instant,
+    pub results: Vec<SyncResult>,
 }
 
-impl SyncProgress {
+pub struct SyncResult {
+    pub name: String,
+    pub branch: String,
+    pub outcome: Result<git::SyncOutcome, String>,
+}
+
+/// How the sync report groups repos, in display order.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SyncGroup {
+    Updated,
+    Failed,
+    Skipped,
+    UpToDate,
+}
+
+impl SyncResult {
+    pub fn group(&self) -> SyncGroup {
+        match &self.outcome {
+            Ok(git::SyncOutcome::Updated { .. }) => SyncGroup::Updated,
+            Ok(git::SyncOutcome::UpToDate) => SyncGroup::UpToDate,
+            Ok(git::SyncOutcome::Skipped(_)) => SyncGroup::Skipped,
+            Err(_) => SyncGroup::Failed,
+        }
+    }
+}
+
+pub struct SyncReport {
+    pub results: Vec<SyncResult>,
+    pub took: Duration,
+}
+
+impl SyncReport {
+    pub fn count(&self, group: SyncGroup) -> usize {
+        self.results.iter().filter(|r| r.group() == group).count()
+    }
+
     fn summary(&self) -> String {
-        format!("Sync: {} updated, {} up to date, {} skipped, {} failed", self.updated, self.unchanged, self.skipped, self.failed)
+        let counts = [
+            (SyncGroup::Updated, "updated"),
+            (SyncGroup::Failed, "failed"),
+            (SyncGroup::Skipped, "skipped"),
+            (SyncGroup::UpToDate, "up to date"),
+        ];
+        let parts: Vec<String> = counts
+            .iter()
+            .map(|&(g, label)| (self.count(g), label))
+            .filter(|&(n, _)| n > 0)
+            .map(|(n, label)| format!("{n} {label}"))
+            .collect();
+        format!("Synced {} repos: {}", self.results.len(), parts.join(", "))
     }
 }
 
@@ -664,7 +708,7 @@ impl App {
                 self.operating.insert(r.path.clone());
             }
         }
-        self.syncing = Some(SyncProgress { total: paths.len(), ..Default::default() });
+        self.syncing = Some(SyncProgress { total: paths.len(), started: Instant::now(), results: Vec::new() });
         self.notice = None;
         let workers = 8.min(paths.len());
         let jobs = Arc::new(Mutex::new(paths.into_iter().rev().collect::<Vec<_>>()));
@@ -682,29 +726,22 @@ impl App {
 
     fn sync_done(&mut self, path: PathBuf, result: Result<git::SyncOutcome, String>) {
         self.operating.remove(&path);
-        let name = self.repo_idx(&path).map(|i| self.repos[i].name.clone()).unwrap_or_else(|| path.display().to_string());
+        let repo = self.repo_idx(&path).map(|i| &self.repos[i]);
+        let name = repo.map(|r| r.name.clone()).unwrap_or_else(|| path.display().to_string());
+        let branch = match repo.and_then(|r| r.status.as_ref()) {
+            Some(Ok(s)) => s.branch.clone(),
+            _ => String::new(),
+        };
         if let Some(progress) = &mut self.syncing {
-            let message = match result {
-                Ok(git::SyncOutcome::Updated(m)) => { progress.updated += 1; format!("UPDATED: {m}") }
-                Ok(git::SyncOutcome::UpToDate) => { progress.unchanged += 1; "UP TO DATE".into() }
-                Ok(git::SyncOutcome::Skipped(m)) => { progress.skipped += 1; format!("SKIPPED: {m}") }
-                Err(e) => { progress.failed += 1; format!("FAILED: {e}") }
-            };
-            progress.done += 1;
-            progress.results.push((name, message));
-            if progress.done == progress.total {
-                let mut progress = self.syncing.take().unwrap();
-                let summary = progress.summary();
-                progress.results.sort_by(|a, b| a.0.cmp(&b.0));
-                let mut lines = vec![summary.clone(), String::new()];
-                for (name, message) in progress.results {
-                    lines.push(name);
-                    lines.push(format!("  {message}"));
-                    lines.push(String::new());
-                }
+            progress.results.push(SyncResult { name, branch, outcome: result });
+            if progress.results.len() == progress.total {
+                let progress = self.syncing.take().unwrap();
+                let mut results = progress.results;
+                results.sort_by(|a, b| a.name.cmp(&b.name));
+                let report = SyncReport { results, took: progress.started.elapsed() };
+                self.notice = Some(report.summary());
                 let back = Box::new(std::mem::replace(&mut self.view, View::List));
-                self.view = View::Diff { title: "Sync all repositories".into(), lines, scroll: 0, back };
-                self.notice = Some(summary);
+                self.view = View::Sync { report, scroll: 0, back };
                 self.last_fetch = Some(Instant::now());
             }
         }
@@ -971,7 +1008,7 @@ impl App {
         match self.view {
             View::List => self.list_key(k),
             View::Detail { .. } => self.detail_key(k),
-            View::Diff { .. } => self.diff_key(k),
+            View::Diff { .. } | View::Sync { .. } => self.diff_key(k),
         }
     }
 
@@ -1149,14 +1186,18 @@ impl App {
         false
     }
 
+    /// Scrolling and going back on the text pages: diffs and the sync report.
     fn diff_key(&mut self, k: KeyEvent) -> bool {
-        let View::Diff { scroll, lines, .. } = &mut self.view else { return false };
-        let max = lines.len().saturating_sub(5) as i32;
+        let (scroll, max) = match &mut self.view {
+            View::Diff { scroll, lines, .. } => (scroll, lines.len().saturating_sub(5) as i32),
+            View::Sync { scroll, .. } => (scroll, i32::from(u16::MAX)),
+            _ => return false,
+        };
         let mut scroll_by = |d: i32| *scroll = (*scroll as i32 + d).clamp(0, max.max(0)) as u16;
         match k.code {
             KeyCode::Char('q') => return true,
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
-                if let View::Diff { back, .. } = std::mem::replace(&mut self.view, View::List) {
+                if let View::Diff { back, .. } | View::Sync { back, .. } = std::mem::replace(&mut self.view, View::List) {
                     self.view = *back;
                 }
             }
@@ -1314,12 +1355,20 @@ mod tests {
                 app.handle(msg);
             }
         }
-        let View::Diff { lines, .. } = &app.view else { panic!("expected results view") };
-        let report = lines.join("\n");
-        assert!(report.contains("1 skipped, 1 failed"), "{report}");
-        assert!(report.contains("hidden\n  SKIPPED: no remote"), "{report}");
-        assert!(report.contains("broken\n  FAILED: fetch failed"), "{report}");
-        assert!(!report.contains("ignored"), "{report}");
+        let View::Sync { report, .. } = &app.view else { panic!("expected results view") };
+        let names: Vec<_> = report.results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["broken", "hidden"]);
+        assert_eq!(app.notice.as_deref(), Some("Synced 2 repos: 1 failed, 1 skipped"));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let screen: Vec<String> =
+            (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()).collect();
+        let row = |name: &str| screen.iter().find(|l| l.trim_start().starts_with(name)).cloned().unwrap_or_default();
+        assert!(row("broken").contains("main  fetch failed"), "{screen:#?}");
+        assert!(row("hidden").contains("main  no remote"), "{screen:#?}");
+        let at = |text: &str| screen.iter().position(|l| l.contains(text));
+        assert!(at("Failed (1)") < at("Skipped (1)"), "{screen:#?}");
         assert!(app.operating.is_empty());
         // Let the final status refresh finish before the temporary repos are removed.
         while app.repos.iter().any(|r| r.busy || r.checking) {

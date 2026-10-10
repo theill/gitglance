@@ -120,7 +120,7 @@ The batch runs in the background, with progress in the header. Each repo fetches
 
 Repos with diverged branches, conflicts, an unfinished Git operation, a missing upstream, or local edits that would need to be stashed before pulling are skipped. Use `u` for a diverged branch, or commit/stash edits, then sync again. Repos with no remote, no commits, or detached HEAD are also skipped. A failure in one repo doesn't stop the rest.
 
-When the batch finishes, a scrollable results view lists each repo's outcome and any errors. Esc returns to your previous view.
+When the batch finishes, a results page shows the totals and then groups the repos: updated ones with the commits they pulled in, failures with their errors, skipped ones with the reason, and finally the names of the repos that were already up to date. Esc returns to your previous view.
 
 ## Ignoring repos
 
