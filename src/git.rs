@@ -163,8 +163,14 @@ pub fn discover(root: &Path, depth: usize) -> Vec<PathBuf> {
     out
 }
 
+/// A stray or empty `.git` folder doesn't make a repo; a real one has a HEAD, and a linked worktree's `.git` is a `gitdir:` file.
 fn is_repo(p: &Path) -> bool {
-    p.join(".git").exists()
+    let dot = p.join(".git");
+    if dot.is_dir() {
+        dot.join("HEAD").is_file()
+    } else {
+        std::fs::read_to_string(&dot).is_ok_and(|s| s.starts_with("gitdir:"))
+    }
 }
 
 fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -784,6 +790,20 @@ pub(crate) mod tests {
         git(&local, &["checkout", "main"]).unwrap();
         std::fs::create_dir(local.join(".git/rebase-merge")).unwrap();
         assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("current Git operation")));
+    }
+
+    #[test]
+    fn discover_skips_folders_with_an_empty_git_dir() {
+        let dir = TestDir::new();
+        std::fs::create_dir(dir.0.join(".git")).unwrap();
+        let group = dir.0.join("group");
+        std::fs::create_dir_all(group.join(".git")).unwrap();
+        let repo = group.join("repo");
+        git(&dir.0, &["init", "--quiet", repo.to_str().unwrap()]).unwrap();
+        commit(&repo, "base", "base");
+        let linked = dir.0.join("linked");
+        git(&repo, &["worktree", "add", "--quiet", "-b", "side", linked.to_str().unwrap()]).unwrap();
+        assert_eq!(discover(&dir.0, 3), vec![group.join("repo"), linked]);
     }
 
     #[test]
