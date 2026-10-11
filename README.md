@@ -132,9 +132,9 @@ Press `U` (Shift+U) in the list or detail view to sync every non-ignored reposit
 
 The batch runs in the background, with progress in the header. Each repo fetches all remotes and fast-forwards its current branch from its upstream if needed. Local commits stay unpushed. Local changes stay uncommitted. Your live AI-summary settings still apply when repo status changes.
 
-Repos with diverged branches, conflicts, an unfinished Git operation, a missing upstream, or local edits that would need to be stashed before pulling are skipped. Use `u` for a diverged branch, or commit/stash edits, then sync again. Repos with no remote, no commits, or detached HEAD are also skipped. A failure in one repo doesn't stop the rest.
+Repos with diverged branches, conflicts, an unfinished Git operation, a missing upstream, or local edits that would need to be stashed before pulling are not pulled. Use `u` for a diverged branch, or commit/stash edits, then sync again. Repos with no remote, no commits, or detached HEAD are quietly skipped. A failure in one repo doesn't stop the rest.
 
-When the batch finishes, a results page shows the totals and then groups the repos: updated ones with the commits they pulled in, failures with their errors, skipped ones with the reason, and finally the names of the repos that were already up to date. Esc returns to your previous view.
+When the batch finishes you stay where you were, and the footer sums it up (e.g. `Synced 14 repos: 2 updated, 1 needs a look (marked !)`). Updated repos simply refresh in the list. A repo that failed or couldn't be pulled gets a red `!` in SYNC and the reason in SUMMARY, and stays listed even if it has no pending changes. The detail page shows the reason too. The marker clears on the next sync or after a successful commit, push or pull in that repo.
 
 ## Ignoring repos
 
