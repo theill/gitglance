@@ -1,5 +1,5 @@
 use crate::git::{self, Activity, Status};
-use crate::{ai, App, Modal, Repo, SummaryState, SyncGroup, SyncReport, View};
+use crate::{ai, App, Modal, Repo, SummaryState, View};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, Wrap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -61,7 +61,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::List => list(f, body, app),
         View::Detail { .. } => detail(f, body, app),
         View::Diff { ref title, ref lines, scroll, .. } => diff(f, body, title, lines, scroll),
-        View::Sync { .. } => sync_report(f, body, app),
     }
     modal(f, body, app);
     footer(f, foot, app);
@@ -163,7 +162,7 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
         spans.push(format!(" · {ignored} ignored").dark_gray());
     }
     if let Some(progress) = &app.syncing {
-        spans.push(format!("   {} syncing {}/{}", spin(app.tick), progress.results.len(), progress.total).cyan());
+        spans.push(format!("   {} syncing {}/{}", spin(app.tick), progress.done, progress.total).cyan());
     } else if app.sync_requested {
         spans.push("   sync queued".cyan());
     } else if busy > 0 {
@@ -229,7 +228,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("esc  ←", "back to the list"),
         ],
     ),
-    ("Diff and sync results", &[("↑↓  space", "scroll, page"), ("g / G", "top / bottom"), ("esc", "back")]),
+    ("Diff", &[("↑↓  space", "scroll, page"), ("g / G", "top / bottom"), ("esc", "back")]),
     (
         "Commit box",
         &[
@@ -249,6 +248,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("≡", "stashes"),
             ("↑N ↓N", "commits to push / to pull"),
             ("✓", "in sync with its upstream"),
+            ("!", "sync all couldn't pull it; the reason is in SUMMARY"),
         ],
     ),
 ];
@@ -344,7 +344,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("A", "agent"),
             ("?", "all keys"),
         ],
-        View::Diff { .. } | View::Sync { .. } => &[("esc", "back"), ("↑↓", "scroll"), ("space", "page"), ("?", "all keys")],
+        View::Diff { .. } => &[("esc", "back"), ("↑↓", "scroll"), ("space", "page"), ("?", "all keys")],
     };
     let mut spans = vec![Span::raw(" ")];
     for (k, label) in keys {
@@ -427,6 +427,9 @@ fn sync_spans(s: &Status) -> Vec<Span<'static>> {
 }
 
 fn summary_cell(r: &Repo, tick: usize) -> Line<'static> {
+    if let Some(issue) = &r.sync_issue {
+        return Line::from(format!("sync: {issue}").red());
+    }
     match &r.summary {
         SummaryState::Done(t) => Line::from(ai::headline(t).to_string()),
         SummaryState::Pending => Line::from(format!("{} summarizing…", spin(tick)).magenta()),
@@ -476,12 +479,16 @@ fn row(r: &Repo, tick: usize, name_w: usize) -> Vec<Line<'static>> {
     } else {
         s.last_commit_ts.map(ago).unwrap_or_default().dark_gray()
     };
+    let mut sync = sync_spans(s);
+    if r.sync_issue.is_some() {
+        sync.splice(0..0, ["!".red().bold(), " ".into()]);
+    }
     vec![
         name,
         Line::from(Span::styled(trunc(&s.branch, 18), branch_style)),
         Line::from(state_spans(s)),
         Line::from(lines_spans(s)),
-        Line::from(sync_spans(s)),
+        Line::from(sync),
         Line::from(age),
         summary_cell(r, tick),
     ]
@@ -625,6 +632,9 @@ fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>
         branch.push(format!("   {} stashed", s.stashes).dark_gray());
     }
     lines.push(Line::from(branch));
+    if let Some(issue) = &r.sync_issue {
+        lines.push(Line::from(vec!["! ".red().bold(), format!("sync all couldn't pull: {issue}").red()]));
+    }
     if let Some(ts) = s.last_commit_ts {
         lines.push(Line::from(vec![
             "last commit ".dark_gray(),
@@ -907,186 +917,4 @@ fn diff(f: &mut Frame, area: Rect, title: &str, lines: &[String], scroll: u16) {
         top,
     );
     f.render_widget(Paragraph::new(shown).block(Block::new().padding(Padding::horizontal(1))), rest);
-}
-
-/// The sync report's groups in display order: marker, heading and color.
-const SYNC_GROUPS: [(SyncGroup, &str, &str, Color); 4] = [
-    (SyncGroup::Updated, "✓", "Updated", Color::Green),
-    (SyncGroup::Failed, "✗", "Failed", Color::Red),
-    (SyncGroup::Skipped, "–", "Skipped", Color::Yellow),
-    (SyncGroup::UpToDate, "·", "Up to date", Color::DarkGray),
-];
-
-/// How many pulled commits the sync report lists per repo; the rest are counted.
-const SYNC_COMMITS: usize = 5;
-
-/// What `U` did. The lines wrap to the terminal width, so this clamps the view's scroll.
-fn sync_report(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::Sync { ref report, scroll, .. } = app.view else { return };
-    let [top, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
-    let lines = sync_lines(report, rest.width.saturating_sub(2) as usize);
-    let height = rest.height.max(1) as usize;
-    let scroll = (scroll as usize).min(lines.len().saturating_sub(height));
-    let n = report.results.len();
-    let mut title = vec![
-        " Sync complete ".yellow().bold(),
-        format!(" {n} repo{} in {}", if n == 1 { "" } else { "s" }, took(report.took)).dark_gray(),
-    ];
-    if lines.len() > height {
-        title.push(format!("   line {}/{}", scroll + 1, lines.len()).dark_gray());
-    }
-    f.render_widget(Line::from(title), top);
-    let shown = lines[scroll..].to_vec();
-    f.render_widget(Paragraph::new(shown).block(Block::new().padding(Padding::horizontal(1))), rest);
-    if let View::Sync { scroll: s, .. } = &mut app.view {
-        *s = scroll as u16;
-    }
-}
-
-fn took(d: Duration) -> String {
-    match d.as_secs() {
-        0..=59 => format!("{:.1}s", d.as_secs_f64()),
-        s => format!("{}m {:02}s", s / 60, s % 60),
-    }
-}
-
-/// Totals first, then the repos that changed or need a look, one aligned row each.
-/// Up-to-date repos are folded into a list of names at the end.
-fn sync_lines(report: &SyncReport, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(20);
-    let mut totals = Vec::new();
-    for &(group, mark, label, color) in &SYNC_GROUPS {
-        let n = report.count(group);
-        if n > 0 {
-            totals.push(Span::styled(format!("{mark} {n} {}", label.to_lowercase()), Style::new().fg(color).bold()));
-            totals.push("    ".into());
-        }
-    }
-    let mut lines = vec![Line::from(totals)];
-    if report.count(SyncGroup::UpToDate) == report.results.len() {
-        lines.push(Line::raw(""));
-        lines.push(Line::from("Nothing new: every repo was already up to date.".dark_gray()));
-        return lines;
-    }
-
-    let listed: Vec<_> = report.results.iter().filter(|r| r.group() != SyncGroup::UpToDate).collect();
-    let name_w = listed.iter().map(|r| r.name.chars().count()).max().unwrap_or(0).min(24);
-    let branch_w = listed.iter().map(|r| r.branch.chars().count()).max().unwrap_or(0).min(16);
-    let indent = 2 + name_w + 2 + if branch_w > 0 { branch_w + 2 } else { 0 };
-    let text_w = width.saturating_sub(indent).max(16);
-    let pad = " ".repeat(indent);
-    for &(group, mark, label, color) in &SYNC_GROUPS {
-        let rows: Vec<_> = report.results.iter().filter(|r| r.group() == group).collect();
-        if rows.is_empty() {
-            continue;
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(format!("── {mark} {label} ({})", rows.len()), Style::new().fg(color).bold())));
-        if group == SyncGroup::UpToDate {
-            for l in wrap(rows.iter().map(|r| r.name.as_str()), "   ", width - 2) {
-                lines.push(Line::from(format!("  {l}").dark_gray()));
-            }
-            continue;
-        }
-        for r in rows {
-            let mut head = vec!["  ".into(), format!("{:<name_w$}  ", trunc(&r.name, name_w)).bold()];
-            if branch_w > 0 {
-                head.push(format!("{:<branch_w$}  ", trunc(&r.branch, branch_w)).dark_gray());
-            }
-            match &r.outcome {
-                Ok(git::SyncOutcome::Updated { count, commits }) => {
-                    head.push(format!("↓ {count} new commit{}", if *count == 1 { "" } else { "s" }).green());
-                    lines.push(Line::from(head));
-                    for c in commits.iter().take(SYNC_COMMITS) {
-                        let mut parts = c.splitn(3, '\t');
-                        let (hash, ts, msg) = (parts.next().unwrap_or(""), parts.next(), parts.next().unwrap_or(""));
-                        let age = ts.and_then(|t| t.parse().ok()).map(ago).unwrap_or_default();
-                        lines.push(Line::from(vec![
-                            pad.clone().into(),
-                            hash.to_string().magenta(),
-                            " ".into(),
-                            format!("{age:>3} ").dark_gray(),
-                            trunc(msg, text_w.saturating_sub(hash.chars().count() + 5)).into(),
-                        ]));
-                    }
-                    let more = (*count as usize).saturating_sub(commits.len().min(SYNC_COMMITS));
-                    if more > 0 {
-                        lines.push(Line::from(format!("{pad}… and {more} more").dark_gray()));
-                    }
-                }
-                Ok(git::SyncOutcome::Skipped(m)) | Err(m) => {
-                    let style = if r.outcome.is_err() { Style::new().red() } else { Style::new() };
-                    let mut wrapped = wrap(m.split_whitespace(), " ", text_w).into_iter();
-                    head.push(Span::styled(wrapped.next().unwrap_or_default(), style));
-                    lines.push(Line::from(head));
-                    lines.extend(wrapped.map(|l| Line::from(vec![pad.clone().into(), Span::styled(l, style)])));
-                }
-                Ok(git::SyncOutcome::UpToDate) => {}
-            }
-        }
-    }
-    lines
-}
-
-/// Joins words with `sep` into lines of at most `width` columns; a longer word gets a line of its own.
-fn wrap<'a>(words: impl IntoIterator<Item = &'a str>, sep: &str, width: usize) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for w in words {
-        if !cur.is_empty() && cur.chars().count() + sep.len() + w.chars().count() > width {
-            lines.push(std::mem::take(&mut cur));
-        }
-        if !cur.is_empty() {
-            cur.push_str(sep);
-        }
-        cur.push_str(w);
-    }
-    if !cur.is_empty() {
-        lines.push(cur);
-    }
-    lines
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::SyncResult;
-
-    fn text(lines: &[Line]) -> Vec<String> {
-        lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>().trim_end().to_string()).collect()
-    }
-
-    #[test]
-    fn sync_report_groups_changes_first_and_folds_up_to_date_repos() {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let commit = |h: &str, s: &str| format!("{h}\t{}\t{s}", now - 7_200);
-        let result = |name: &str, branch: &str, outcome| SyncResult { name: name.into(), branch: branch.into(), outcome };
-        let mut results = vec![
-            result("gitglance", "develop", Ok(git::SyncOutcome::Updated {
-                count: 7,
-                commits: (1..=7).map(|i| commit(&format!("abc{i:04}"), &format!("feat: change number {i}"))).collect(),
-            })),
-            result("referat", "main", Ok(git::SyncOutcome::Updated { count: 1, commits: vec![commit("def0001", "fix: typo")] })),
-            result("old-site", "master", Err("fetch failed: fatal: unable to access 'https://example.com/old-site.git/': Could not resolve host: example.com".into())),
-            result("skan", "feature/scanner", Ok(git::SyncOutcome::Skipped("branch has diverged; use u to rebase, then sync again".into()))),
-        ];
-        for name in ["alpha", "beta", "dotfiles", "notes", "website", "kode", "stille", "oplaes"] {
-            results.push(result(name, "main", Ok(git::SyncOutcome::UpToDate)));
-        }
-        let report = SyncReport { results, took: Duration::from_millis(3_400) };
-        let lines = text(&sync_lines(&report, 80));
-        assert_eq!(lines[0], "✓ 2 updated    ✗ 1 failed    – 1 skipped    · 8 up to date");
-        assert!(lines.iter().any(|l| l == "  gitglance  develop          ↓ 7 new commits"), "{lines:#?}");
-        assert!(lines.iter().any(|l| l.ends_with("… and 2 more")), "{lines:#?}");
-        let at = |t: &str| lines.iter().position(|l| l.contains(t)).unwrap();
-        assert!(at("Updated (2)") < at("Failed (1)") && at("Failed (1)") < at("Skipped (1)") && at("Skipped (1)") < at("Up to date (8)"));
-        assert!(lines.iter().all(|l| l.chars().count() <= 80), "{lines:#?}");
-    }
-
-    #[test]
-    fn sync_report_says_so_when_nothing_changed() {
-        let results = vec![SyncResult { name: "a".into(), branch: "main".into(), outcome: Ok(git::SyncOutcome::UpToDate) }];
-        let lines = text(&sync_lines(&SyncReport { results, took: Duration::ZERO }, 80));
-        assert_eq!(lines, ["· 1 up to date", "", "Nothing new: every repo was already up to date."]);
-    }
 }

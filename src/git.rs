@@ -308,51 +308,54 @@ pub fn fetch(repo: &Path) -> Result<String, String> {
 }
 
 pub enum SyncOutcome {
-    /// Fast-forwarded over `count` commits; `commits` holds the newest of them, formatted like `Status::incoming`.
-    Updated { count: u32, commits: Vec<String> },
+    /// Fast-forwarded over this many commits.
+    Updated(u32),
     UpToDate,
-    Skipped(String),
+    /// Nothing to sync (no commits, no remote, detached HEAD or no upstream); not a problem.
+    Skipped,
+    /// Something in the repo stopped the pull and needs a look.
+    Blocked(String),
 }
 
 /// Fetch and fast-forward the current branch without committing edits or rebasing unattended.
 pub fn sync(repo: &Path) -> Result<SyncOutcome, String> {
     let s = status(repo)?;
     if s.initial {
-        return Ok(SyncOutcome::Skipped("no commits yet".into()));
+        return Ok(SyncOutcome::Skipped);
     }
     if !s.has_remote {
-        return Ok(SyncOutcome::Skipped("no remote".into()));
+        return Ok(SyncOutcome::Skipped);
     }
     if s.branch == "(detached)" {
-        return Ok(SyncOutcome::Skipped("detached HEAD".into()));
+        return Ok(SyncOutcome::Skipped);
     }
     let in_progress = ["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer"]
         .iter()
         .any(|name| git_path_exists(repo, name));
     if s.conflicts > 0 || in_progress {
-        return Ok(SyncOutcome::Skipped("resolve the current Git operation or conflicts first".into()));
+        return Ok(SyncOutcome::Blocked("resolve the current Git operation or conflicts first".into()));
     }
     fetch(repo).map_err(|e| format!("fetch failed: {e}"))?;
     // The dashboard's ahead/behind counts can be stale until the fetch completes.
     let s = status(repo)?;
     if !s.tracking && s.upstream.is_some() {
-        return Ok(SyncOutcome::Skipped("upstream no longer exists; choose an upstream first".into()));
+        return Ok(SyncOutcome::Blocked("upstream no longer exists; choose an upstream first".into()));
     }
     if !s.tracking {
-        return Ok(SyncOutcome::Skipped("no upstream to pull from".into()));
+        return Ok(SyncOutcome::Skipped);
     }
     if s.ahead > 0 && s.behind > 0 {
-        return Ok(SyncOutcome::Skipped("branch has diverged; use u to rebase, then sync again".into()));
+        return Ok(SyncOutcome::Blocked("branch has diverged; use u to rebase, then sync again".into()));
     }
     if s.behind > 0 && s.dirty() {
-        return Ok(SyncOutcome::Skipped("commit or stash local changes before pulling".into()));
+        return Ok(SyncOutcome::Blocked("commit or stash local changes before pulling".into()));
     }
     if s.behind == 0 {
         return Ok(SyncOutcome::UpToDate);
     }
     // Integrate the upstream we just fetched. No second fetch or automatic stash is needed.
     git(repo, &["merge", "--ff-only", "--quiet", "@{u}"]).map_err(|e| format!("fast-forward failed: {e}"))?;
-    Ok(SyncOutcome::Updated { count: s.behind, commits: s.incoming })
+    Ok(SyncOutcome::Updated(s.behind))
 }
 
 fn git_path_exists(repo: &Path, name: &str) -> bool {
@@ -706,7 +709,7 @@ pub(crate) mod tests {
         commit(&peer, "incoming", "incoming");
         git(&peer, &["push"]).unwrap();
         assert_eq!(status(&local).unwrap().behind, 0, "counts are stale before fetch");
-        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Updated { count: 1, commits } if commits[0].ends_with("\tincoming")));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Updated(1)));
         assert_eq!(head(&local), head(&peer));
         assert!(matches!(sync(&local).unwrap(), SyncOutcome::UpToDate));
     }
@@ -735,7 +738,7 @@ pub(crate) mod tests {
         commit(&peer, "incoming", "incoming");
         git(&peer, &["push"]).unwrap();
         let (local_head, remote_head) = (head(&local), head(&remote));
-        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("diverged")));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Blocked(m) if m.contains("diverged")));
         assert_eq!(head(&local), local_head);
         assert_eq!(head(&remote), remote_head);
         assert!(!rebase_in_progress(&local));
@@ -748,7 +751,7 @@ pub(crate) mod tests {
         git(&peer, &["push"]).unwrap();
         std::fs::write(local.join("base"), "local edit").unwrap();
         let before = head(&local);
-        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("local changes")));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Blocked(m) if m.contains("local changes")));
         assert_eq!(head(&local), before);
         assert_eq!(std::fs::read_to_string(local.join("base")).unwrap(), "local edit");
         assert_eq!(status(&local).unwrap().stashes, 0);
@@ -759,12 +762,12 @@ pub(crate) mod tests {
         let (_dir, remote, local, peer) = setup();
         git(&local, &["checkout", "-b", "feature"]).unwrap();
         commit(&local, "feature", "feature");
-        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("no upstream")));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped));
         assert!(status(&local).unwrap().upstream.is_none());
         assert!(git(&remote, &["rev-parse", "--verify", "refs/heads/feature"]).is_err());
         git(&local, &["push", "--set-upstream", "origin", "feature"]).unwrap();
         git(&peer, &["push", "origin", "--delete", "feature"]).unwrap();
-        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("upstream no longer exists")));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Blocked(m) if m.contains("upstream no longer exists")));
         assert!(git(&remote, &["rev-parse", "--verify", "refs/heads/feature"]).is_err());
     }
 
@@ -780,10 +783,10 @@ pub(crate) mod tests {
     fn sync_skips_detached_and_in_progress_repos() {
         let (_dir, _, local, _) = setup();
         git(&local, &["checkout", "--detach"]).unwrap();
-        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("detached")));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped));
         git(&local, &["checkout", "main"]).unwrap();
         std::fs::create_dir(local.join(".git/rebase-merge")).unwrap();
-        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Skipped(m) if m.contains("current Git operation")));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Blocked(m) if m.contains("current Git operation")));
     }
 
     #[test]

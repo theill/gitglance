@@ -79,6 +79,8 @@ pub struct Repo {
     /// Commit activity for the detail page, loaded when the repo is opened.
     pub activity: Option<Result<git::Activity, String>>,
     pub ignored: bool,
+    /// Why the last sync all couldn't pull this repo; cleared by the next sync or a successful Git operation.
+    pub sync_issue: Option<String>,
 }
 
 impl Repo {
@@ -103,6 +105,7 @@ impl Repo {
             settling: None,
             activity: None,
             ignored: false,
+            sync_issue: None,
         }
     }
 
@@ -115,6 +118,11 @@ impl Repo {
             Some(Err(_)) => true,
             None => false,
         }
+    }
+
+    /// Belongs in the changes-only list: pending work, or a sync problem to look at.
+    fn listed(&self) -> bool {
+        self.attention() || (!self.ignored && self.sync_issue.is_some())
     }
 }
 
@@ -177,66 +185,32 @@ pub enum View {
     /// `sel` indexes `detail_items`; `None` means nothing is highlighted yet.
     Detail { path: PathBuf, scroll: u16, sel: Option<usize> },
     Diff { title: String, lines: Vec<String>, scroll: u16, back: Box<View> },
-    /// The report wraps to the terminal width, so drawing it clamps `scroll`.
-    Sync { report: SyncReport, scroll: u16, back: Box<View> },
 }
 
 pub struct SyncProgress {
     pub total: usize,
-    started: Instant,
-    pub results: Vec<SyncResult>,
+    pub done: usize,
+    updated: usize,
+    /// Commits pulled in across the updated repos.
+    commits: u32,
+    issues: usize,
 }
 
-pub struct SyncResult {
-    pub name: String,
-    pub branch: String,
-    pub outcome: Result<git::SyncOutcome, String>,
-}
-
-/// How the sync report groups repos, in display order.
-#[derive(Clone, Copy, PartialEq)]
-pub enum SyncGroup {
-    Updated,
-    Failed,
-    Skipped,
-    UpToDate,
-}
-
-impl SyncResult {
-    pub fn group(&self) -> SyncGroup {
-        match &self.outcome {
-            Ok(git::SyncOutcome::Updated { .. }) => SyncGroup::Updated,
-            Ok(git::SyncOutcome::UpToDate) => SyncGroup::UpToDate,
-            Ok(git::SyncOutcome::Skipped(_)) => SyncGroup::Skipped,
-            Err(_) => SyncGroup::Failed,
-        }
-    }
-}
-
-pub struct SyncReport {
-    pub results: Vec<SyncResult>,
-    pub took: Duration,
-}
-
-impl SyncReport {
-    pub fn count(&self, group: SyncGroup) -> usize {
-        self.results.iter().filter(|r| r.group() == group).count()
-    }
-
+impl SyncProgress {
+    /// One line for the footer; the repos that need a look carry their own marker in the list.
     fn summary(&self) -> String {
-        let counts = [
-            (SyncGroup::Updated, "updated"),
-            (SyncGroup::Failed, "failed"),
-            (SyncGroup::Skipped, "skipped"),
-            (SyncGroup::UpToDate, "up to date"),
-        ];
-        let parts: Vec<String> = counts
-            .iter()
-            .map(|&(g, label)| (self.count(g), label))
-            .filter(|&(n, _)| n > 0)
-            .map(|(n, label)| format!("{n} {label}"))
-            .collect();
-        format!("Synced {} repos: {}", self.results.len(), parts.join(", "))
+        let mut parts = Vec::new();
+        if self.updated > 0 {
+            let s = if self.commits == 1 { "" } else { "s" };
+            parts.push(format!("{} updated ({} commit{s})", self.updated, self.commits));
+        }
+        if self.issues > 0 {
+            parts.push(format!("{} need{} a look (marked !)", self.issues, if self.issues == 1 { "s" } else { "" }));
+        }
+        if parts.is_empty() {
+            parts.push("everything up to date".into());
+        }
+        format!("Synced {} repos: {}", self.total, parts.join(", "))
     }
 }
 
@@ -353,11 +327,11 @@ impl App {
         let mut v: Vec<usize> = (0..self.repos.len())
             .filter(|&i| {
                 let r = &self.repos[i];
-                let shown = if r.ignored { self.show_ignored } else { self.show_all || r.attention() };
+                let shown = if r.ignored { self.show_ignored } else { self.show_all || r.listed() };
                 shown && (f.is_empty() || r.name.to_lowercase().contains(&f))
             })
             .collect();
-        v.sort_by_key(|&i| (self.repos[i].ignored, !self.repos[i].attention()));
+        v.sort_by_key(|&i| (self.repos[i].ignored, !self.repos[i].listed()));
         v
     }
 
@@ -737,7 +711,7 @@ impl App {
                 self.operating.insert(r.path.clone());
             }
         }
-        self.syncing = Some(SyncProgress { total: paths.len(), started: Instant::now(), results: Vec::new() });
+        self.syncing = Some(SyncProgress { total: paths.len(), done: 0, updated: 0, commits: 0, issues: 0 });
         self.notice = None;
         let workers = 8.min(paths.len());
         let jobs = Arc::new(Mutex::new(paths.into_iter().rev().collect::<Vec<_>>()));
@@ -755,24 +729,29 @@ impl App {
 
     fn sync_done(&mut self, path: PathBuf, result: Result<git::SyncOutcome, String>) {
         self.operating.remove(&path);
-        let repo = self.repo_idx(&path).map(|i| &self.repos[i]);
-        let name = repo.map(|r| r.name.clone()).unwrap_or_else(|| path.display().to_string());
-        let branch = match repo.and_then(|r| r.status.as_ref()) {
-            Some(Ok(s)) => s.branch.clone(),
-            _ => String::new(),
+        let pulled = match result {
+            Ok(git::SyncOutcome::Updated(n)) => Some(n),
+            _ => None,
+        };
+        // Up-to-date and updated repos need nothing; neither does one with nothing to sync, like a local-only repo.
+        let issue = match result {
+            Err(e) => Some(e),
+            Ok(git::SyncOutcome::Blocked(m)) => Some(m),
+            Ok(_) => None,
         };
         if let Some(progress) = &mut self.syncing {
-            progress.results.push(SyncResult { name, branch, outcome: result });
-            if progress.results.len() == progress.total {
-                let progress = self.syncing.take().unwrap();
-                let mut results = progress.results;
-                results.sort_by(|a, b| a.name.cmp(&b.name));
-                let report = SyncReport { results, took: progress.started.elapsed() };
-                self.notice = Some(report.summary());
-                let back = Box::new(std::mem::replace(&mut self.view, View::List));
-                self.view = View::Sync { report, scroll: 0, back };
+            progress.done += 1;
+            progress.updated += usize::from(pulled.is_some());
+            progress.commits += pulled.unwrap_or(0);
+            progress.issues += usize::from(issue.is_some());
+            if progress.done == progress.total {
+                self.notice = Some(progress.summary());
+                self.syncing = None;
                 self.last_fetch = Some(Instant::now());
             }
+        }
+        if let Some(i) = self.repo_idx(&path) {
+            self.repos[i].sync_issue = issue;
         }
         // Refresh quietly so bulk sync doesn't trigger AI summaries.
         self.spawn_scan(vec![path], false, true);
@@ -935,7 +914,11 @@ impl App {
             }
             Msg::GitDone { path, result } => {
                 self.operating.remove(&path);
-                let name = self.repo_idx(&path).map(|i| self.repos[i].name.clone()).unwrap_or_default();
+                let i = self.repo_idx(&path);
+                let name = i.map(|i| self.repos[i].name.clone()).unwrap_or_default();
+                if let (Some(i), Ok(_)) = (i, &result) {
+                    self.repos[i].sync_issue = None;
+                }
                 self.notice = Some(match result {
                     Ok(m) => format!("{name}: {m} ✓"),
                     Err(e) => format!("{name}: {e}"),
@@ -1093,7 +1076,7 @@ impl App {
         match self.view {
             View::List => self.list_key(k),
             View::Detail { .. } => self.detail_key(k),
-            View::Diff { .. } | View::Sync { .. } => self.diff_key(k),
+            View::Diff { .. } => self.diff_key(k),
         }
     }
 
@@ -1281,18 +1264,15 @@ impl App {
         false
     }
 
-    /// Scrolling and going back on the text pages: diffs and the sync report.
+    /// Scrolling and going back on the diff pages.
     fn diff_key(&mut self, k: KeyEvent) -> bool {
-        let (scroll, max) = match &mut self.view {
-            View::Diff { scroll, lines, .. } => (scroll, lines.len().saturating_sub(5) as i32),
-            View::Sync { scroll, .. } => (scroll, i32::from(u16::MAX)),
-            _ => return false,
-        };
+        let View::Diff { scroll, lines, .. } = &mut self.view else { return false };
+        let max = lines.len().saturating_sub(5) as i32;
         let mut scroll_by = |d: i32| *scroll = (*scroll as i32 + d).clamp(0, max.max(0)) as u16;
         match k.code {
             KeyCode::Char('q') => return true,
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
-                if let View::Diff { back, .. } | View::Sync { back, .. } = std::mem::replace(&mut self.view, View::List) {
+                if let View::Diff { back, .. } = std::mem::replace(&mut self.view, View::List) {
                     self.view = *back;
                 }
             }
@@ -1504,26 +1484,36 @@ mod tests {
                 app.handle(msg);
             }
         }
-        let View::Sync { report, .. } = &app.view else { panic!("expected results view") };
-        let names: Vec<_> = report.results.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["broken", "hidden"]);
-        assert_eq!(app.notice.as_deref(), Some("Synced 2 repos: 1 failed, 1 skipped"));
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
-        term.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let buf = term.backend().buffer();
-        let screen: Vec<String> =
-            (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()).collect();
-        let row = |name: &str| screen.iter().find(|l| l.trim_start().starts_with(name)).cloned().unwrap_or_default();
-        assert!(row("broken").contains("main  fetch failed"), "{screen:#?}");
-        assert!(row("hidden").contains("main  no remote"), "{screen:#?}");
-        let at = |text: &str| screen.iter().position(|l| l.contains(text));
-        assert!(at("Failed (1)") < at("Skipped (1)"), "{screen:#?}");
+        // No results page: the list stays put, and only the failed repo gets a marker.
+        assert!(matches!(app.view, View::List));
+        assert_eq!(app.notice.as_deref(), Some("Synced 2 repos: 1 needs a look (marked !)"));
+        fn issue(app: &App, name: &str) -> Option<String> {
+            app.repos.iter().find(|r| r.name == name).unwrap().sync_issue.clone()
+        }
+        assert!(issue(&app, "broken").unwrap().contains("fetch failed"));
+        assert_eq!(issue(&app, "hidden"), None, "a repo with no remote is skipped quietly");
         assert!(app.operating.is_empty());
         // Let the final status refresh finish before the temporary repos are removed.
         while app.repos.iter().any(|r| r.busy || r.checking) {
             app.handle(app.rx.recv_timeout(Duration::from_secs(5)).unwrap());
         }
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(matches!(app.view, View::List));
+        app.filter.clear();
+        app.notice = None;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+        term.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let screen: Vec<String> =
+            (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()).collect();
+        let row = |name: &str| screen.iter().find(|l| l.trim_start_matches([' ', '▌']).starts_with(name)).cloned();
+        let broken = row("broken").expect("the failed repo is listed");
+        assert!(broken.contains("! ") && broken.contains("fetch failed"), "{screen:#?}");
+        assert!(row("hidden").is_none_or(|l| !l.contains('!')), "{screen:#?}");
+        // A successful operation on the repo clears its marker.
+        let path = dir.0.join("broken");
+        app.start_op(path.clone(), |_| Ok("done".into()));
+        while app.operating.contains(&path) || app.repos.iter().any(|r| r.busy || r.checking) {
+            app.handle(app.rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        assert_eq!(issue(&app, "broken"), None);
     }
 }
