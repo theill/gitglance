@@ -153,6 +153,8 @@ Ignored repos aren't scanned, so they also make the scan faster.
 
 These run `claude -p` with Haiku and no tools, in a neutral directory. The prompt gets the file list, unpushed commits, the diff (lockfiles left out, capped at 60 KB) and the start of new files. Results are cached in `~/.cache/gitglance`, keyed by that content, so a repo that hasn't changed never costs a second call.
 
+Each summary has two levels. The list shows a headline of at most about 50 characters that names what the work is (the feature, fix or screen), never its git state, since the other columns already show that. Merge commits are left out of the prompt so they don't crowd out the real work. Opening a repo shows the full summary, with specific bullets grouped under Uncommitted, Not pushed and To pull.
+
 Code only leaves your machine when you ask for it: `s`, `S`, `c`, `--summarize`, by opening a repo with changes for half a second, or when the live refresh finds new changes that then stay the same for 10 seconds (turn both off with `--no-auto-summary`). Commit messages are drafted in the background only for repos you've already summarized. Secret-looking files (`.env*`, `*.pem`, `*.key`, `*.p8`, `*.p12`, SSH keys, anything named `credentials` or `secret`) are listed by name, but their contents are never sent.
 
 - `GITGLANCE_MODEL=sonnet` picks another model.

@@ -7,10 +7,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const SUMMARY_INSTRUCTION: &str = "Everything you need is in the text below: you cannot run commands or open files, so never say you will look something up, and work only from what is given. You summarize the pending work in a local git repository (uncommitted changes, commits not yet pushed, and commits on the remote not yet pulled) for a developer who juggles 10-15 projects at once and needs to recall quickly where each one stands. Reply in plain text, with no markdown headings or bold.
-Line 1: a headline of at most 70 characters that captures the gist of the work in progress.
-Then a blank line, then 2-5 bullets starting with \"- \", one short line each, describing what changed, grouped by intent rather than by file.
+Line 1: a headline of at most 50 characters. It sits in a narrow column right next to the repo name, branch, file counts and ahead/behind counts, so it must say only what the work is about, never its git state. Name the concrete thing that changes: the feature, screen, command, endpoint, setting or bug. Good: \"Unfollow command and follows list in TUI\", \"Fix stalled calls in history classification\", \"Claims graph with backfill from events log\". Bad: \"Incoming: build fix and p5 merge\", \"Pull two upstream commits\", \"Merged develop\", \"partner-app: six commits to pull\", \"WIP on feature branch\". Never mention pulling, pushing, incoming, behind, ahead, unpushed, merges, commit counts, branch names, hashes or the repository name. Merge commits mean nothing on their own: describe the work they carry. If several things are pending, name the most significant, preferring uncommitted changes, then commits not pushed yet, then commits to pull. No trailing period.
+Then a blank line, then the detail shown when the repo is opened. Use these labels, each on its own line and only the ones that apply, in this order: \"Uncommitted:\", \"Not pushed:\", \"To pull:\". Under each, 1-4 bullets starting with \"- \", one line each, grouped by intent rather than by file. Be specific: name the functions, files, screens, commands, settings or behaviour that changed and how, so the developer can pick the work up again without reading the diff. When a commit has only its subject to go on, restate what it does in plain words; never comment on what information is missing. Skip merge commits and pure noise such as version bumps or formatting.
 Finally, only if relevant, one line starting with \"Heads-up: \" that flags anything risky: merge conflicts, secrets or credentials, debug leftovers, large generated or binary files, work that looks half-done, or a branch that has never been pushed.
 No preamble and no closing remarks.";
+
+/// Labels that group the detail bullets; see `SUMMARY_INSTRUCTION`.
+pub const SECTION_LABELS: [&str; 3] = ["Uncommitted:", "Not pushed:", "To pull:"];
+
+/// Git-state lead-ins the model sometimes puts in front of a headline anyway; the list columns already say this.
+const STATE_PREFIXES: [&str; 10] =
+    ["incoming", "pull", "pending", "pull pending", "to pull", "unpushed", "not pushed", "uncommitted", "wip", "behind"];
 
 const COMMIT_INSTRUCTION: &str = "Everything you need is in the text below: you cannot run commands or open files. Write the git commit message for the uncommitted changes below; all of them are committed together (git add -A). Describe only those changes, not the commits listed as not pushed yet. Match the style of the repository's recent commit messages shown under \"Recent commit messages\": the same language, prefixes such as gitmoji or conventional-commit types, casing and length. Keep the subject line to 72 characters at most. Add a blank line and a few short body lines only when the change is too big for the subject alone. Output only the commit message, with no quotes, code fences or commentary.";
 
@@ -77,16 +84,26 @@ fn context_with_budget(repo: &Path, s: &Status, diff_budget: usize) -> String {
         }
     }
 
+    // Merge commits, and commits a merge brought in from another remote branch (say develop), are not this
+    // branch's own work; listing them made headlines like "Merged develop".
     if s.unpushed_count > 0 {
-        let _ = writeln!(c, "\nCommits not pushed yet ({}):", s.unpushed_count);
-        for l in &s.unpushed {
-            let _ = writeln!(c, "{l}");
+        let own = git::git(repo, &["log", "--no-merges", "--format=%h %s", "-n", "30", "HEAD", "--not", "--remotes"])
+            .unwrap_or_default();
+        let _ = writeln!(
+            c,
+            "\nCommits not pushed yet ({}; merges and commits already on another remote branch left out):",
+            s.unpushed_count
+        );
+        if own.trim().is_empty() {
+            let _ = writeln!(c, "(only merges of work that is already on the remote)");
+        } else {
+            c.push_str(&own);
         }
     }
 
     if s.tracking && s.behind > 0 {
-        let _ = writeln!(c, "\nCommits on the remote that have not been pulled yet ({}):", s.behind);
-        c.push_str(&git::git(repo, &["log", "--format=%h %s", "-n", "30", "HEAD..@{u}"]).unwrap_or_default());
+        let _ = writeln!(c, "\nCommits on the remote that have not been pulled yet ({}; merges left out):", s.behind);
+        c.push_str(&git::git(repo, &["log", "--no-merges", "--format=%h %s", "-n", "30", "HEAD..@{u}"]).unwrap_or_default());
     }
 
     if s.staged + s.unstaged + s.conflicts > 0 {
@@ -234,17 +251,35 @@ fn ask(instruction: &str, context: &str, force: bool) -> Result<String, String> 
     Ok(text)
 }
 
-pub fn headline(summary: &str) -> &str {
+/// The first line of a summary, as the list shows it. `repo` is the repo's name, which the list already shows.
+pub fn headline<'a>(summary: &'a str, repo: &str) -> &'a str {
     let line = summary.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     let line = line.trim_start_matches(|c: char| c == '#' || c == '*' || c == '-' || c.is_whitespace());
     let line = line.strip_prefix("Headline:").unwrap_or(line);
-    line.trim().trim_end_matches("**")
+    let line = match line.split_once(':') {
+        Some((lead, rest))
+            if lead.trim().eq_ignore_ascii_case(repo) || STATE_PREFIXES.contains(&lead.trim().to_lowercase().as_str()) =>
+        {
+            rest
+        }
+        _ => line,
+    };
+    line.trim().trim_end_matches("**").trim_end_matches('.')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn headline_drops_git_state_lead_ins() {
+        assert_eq!(headline("Incoming: build resume fix\n\n- x", "api"), "build resume fix");
+        assert_eq!(headline("Pull pending: native page panels.", "api"), "native page panels");
+        assert_eq!(headline("tabel: App Store review reply", "tabel"), "App Store review reply");
+        assert_eq!(headline("**Fix stalled calls**", "api"), "Fix stalled calls");
+        assert_eq!(headline("TUI: unfollow command", "kvidre"), "TUI: unfollow command");
+    }
 
     #[test]
     fn secrets_never_reach_the_prompt() {

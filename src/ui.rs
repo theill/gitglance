@@ -428,7 +428,7 @@ fn sync_spans(s: &Status) -> Vec<Span<'static>> {
 
 fn summary_cell(r: &Repo, tick: usize) -> Line<'static> {
     match &r.summary {
-        SummaryState::Done(t) => Line::from(ai::headline(t).to_string()),
+        SummaryState::Done(t) => Line::from(ai::headline(t, &r.name).to_string()),
         SummaryState::Pending => Line::from(format!("{} summarizing…", spin(tick)).magenta()),
         SummaryState::Failed(e) => Line::from(format!("AI failed: {e}").red()),
         SummaryState::None if r.settling.is_some() => Line::from("summarizing once the changes settle…".dark_gray()),
@@ -645,7 +645,7 @@ fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>
     section(&mut lines, "AI summary".into(), if r.context.is_some() { "s to regenerate" } else { "" });
     match &r.summary {
         SummaryState::Done(t) => {
-            let head = ai::headline(t).to_string();
+            let head = ai::headline(t, &r.name).to_string();
             let mut first = true;
             for l in t.lines() {
                 if first && !l.trim().is_empty() {
@@ -653,6 +653,8 @@ fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>
                     first = false;
                 } else if l.trim_start().starts_with("Heads-up") {
                     lines.push(Line::from(l.to_string().yellow()));
+                } else if ai::SECTION_LABELS.contains(&l.trim()) {
+                    lines.push(Line::from(l.trim().to_string().dark_gray().bold()));
                 } else {
                     lines.push(Line::from(l.to_string()));
                 }
