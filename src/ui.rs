@@ -1,5 +1,6 @@
 use crate::git::{self, Activity, Status};
-use crate::{ai, App, Modal, Repo, SummaryState, View};
+use crate::{ai, App, BoardRow, Group, Modal, Period, Repo, SummaryState, View};
+use std::cmp::Reverse;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, Wrap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,11 +37,60 @@ fn since(t: Instant) -> String {
 
 /// Marks a repo a background re-check found changed: bright for the first minute, dim for ten.
 fn change_mark(r: &Repo) -> Span<'static> {
-    match r.changed_at.map(|t| t.elapsed()) {
+    fresh_mark(r.changed_at)
+}
+
+/// Marks something that changed or arrived at `t`: bright for the first minute, dim for ten.
+fn fresh_mark(t: Option<Instant>) -> Span<'static> {
+    match t.map(|t| t.elapsed()) {
         Some(d) if d < Duration::from_secs(60) => "●".yellow().bold(),
         Some(d) if d < Duration::from_secs(600) => "•".dark_gray(),
         _ => " ".into(),
     }
+}
+
+/// The gitmoji shortcodes (gitmoji.dev), for commit subjects written as `:wrench: Fix…` rather than `🔧 Fix…`.
+/// Emoji are written without the variation selector, so the terminal and the layout agree on their width.
+const GITMOJI: &[(&str, &str)] = &[
+    ("adhesive_bandage", "🩹"), ("airplane", "✈"), ("alembic", "⚗"), ("alien", "👽"), ("ambulance", "🚑"),
+    ("arrow_down", "⬇"), ("arrow_up", "⬆"), ("art", "🎨"), ("beers", "🍻"), ("bento", "🍱"), ("bookmark", "🔖"),
+    ("boom", "💥"), ("bricks", "🧱"), ("bug", "🐛"), ("building_construction", "🏗"), ("bulb", "💡"),
+    ("busts_in_silhouette", "👥"), ("camera_flash", "📸"), ("card_file_box", "🗃"), ("chart_with_upwards_trend", "📈"),
+    ("children_crossing", "🚸"), ("closed_lock_with_key", "🔐"), ("clown_face", "🤡"), ("coffin", "⚰"),
+    ("construction", "🚧"), ("construction_worker", "👷"), ("dizzy", "💫"), ("egg", "🥚"), ("fire", "🔥"),
+    ("globe_with_meridians", "🌐"), ("goal_net", "🥅"), ("green_heart", "💚"), ("hammer", "🔨"),
+    ("heavy_minus_sign", "➖"), ("heavy_plus_sign", "➕"), ("iphone", "📱"), ("label", "🏷"), ("lipstick", "💄"),
+    ("lock", "🔒"), ("loud_sound", "🔊"), ("mag", "🔍"), ("memo", "📝"), ("money_with_wings", "💸"),
+    ("monocle_face", "🧐"), ("mute", "🔇"), ("necktie", "👔"), ("package", "📦"), ("page_facing_up", "📄"),
+    ("passport_control", "🛂"), ("pencil2", "✏"), ("poop", "💩"), ("pushpin", "📌"), ("recycle", "♻"),
+    ("rewind", "⏪"), ("rocket", "🚀"), ("rotating_light", "🚨"), ("safety_vest", "🦺"), ("see_no_evil", "🙈"),
+    ("seedling", "🌱"), ("sparkles", "✨"), ("speech_balloon", "💬"), ("stethoscope", "🩺"), ("tada", "🎉"),
+    ("technologist", "🧑‍💻"), ("test_tube", "🧪"), ("thread", "🧵"), ("triangular_flag_on_post", "🚩"),
+    ("truck", "🚚"), ("twisted_rightwards_arrows", "🔀"), ("wastebasket", "🗑"), ("wheelchair", "♿"),
+    ("white_check_mark", "✅"), ("wrench", "🔧"), ("zap", "⚡"),
+];
+
+/// Turns gitmoji shortcodes into their emoji: `:wrench: Release` → `🔧 Release`. Anything else stays as written.
+pub fn emojify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find(':') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let code = after.find(':').map(|end| &after[..end]);
+        match code.and_then(|c| GITMOJI.iter().find(|(k, _)| *k == c)) {
+            Some((code, emoji)) => {
+                out.push_str(emoji);
+                rest = &after[code.len() + 1..];
+            }
+            None => {
+                out.push(':');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn trunc(s: &str, w: usize) -> String {
@@ -61,6 +111,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::List => list(f, body, app),
         View::Detail { .. } => detail(f, body, app),
         View::Diff { ref title, ref lines, scroll, .. } => diff(f, body, title, lines, scroll),
+        View::Commits => commits(f, body, app),
     }
     modal(f, body, app);
     footer(f, foot, app);
@@ -171,7 +222,12 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
     if thinking > 0 {
         spans.push(format!("   {} summarizing {thinking}", spin(app.tick)).magenta());
     }
-    spans.push(if app.show_all { "   [all repos]".dark_gray() } else { "   [with changes]".dark_gray() });
+    spans.push(match app.view {
+        View::Commits => "   [recent commits]".dark_gray(),
+        View::Diff { ref back, .. } if matches!(**back, View::Commits) => "   [recent commits]".dark_gray(),
+        _ if app.show_all => "   [all repos]".dark_gray(),
+        _ => "   [with changes]".dark_gray(),
+    });
     if app.live {
         spans.push("   ● live".green());
         spans.push(match (app.fetch_every, app.last_fetch) {
@@ -210,6 +266,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("f / r", "fetch every repo / rescan"),
             ("w", "pause or resume the live refresh"),
             ("a", "repos with changes ↔ all repos"),
+            ("tab", "repos with recent commits, and what they are"),
             ("/", "filter by name"),
             ("x / I", "ignore or un-ignore / show ignored"),
             ("q  esc", "quit"),
@@ -228,6 +285,18 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("esc  ←", "back to the list"),
         ],
     ),
+    (
+        "Recent commits",
+        &[
+            ("↑↓ j k", "move  (g/G top/bottom, PgUp/PgDn)"),
+            ("⏎", "commit: show it · repo: unfold or fold"),
+            ("[ ]  1–4", "period: last hour, today, 24 hours, 7 days"),
+            ("n / p", "next / previous commit, on that page"),
+            ("/", "filter by repo, author, branch or message"),
+            ("t A R o", "shell, agent, resume, folder for its repo"),
+            ("tab  esc", "back to the repo list"),
+        ],
+    ),
     ("Diff", &[("↑↓  space", "scroll, page"), ("g / G", "top / bottom"), ("esc", "back")]),
     (
         "Commit box",
@@ -243,10 +312,10 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Symbols",
         &[
-            ("●  •", "changed in the last minute / ten minutes"),
+            ("●  •", "changed or new in the last minute / ten minutes"),
             ("S M ? U", "staged, modified, untracked, conflicts"),
             ("≡", "stashes"),
-            ("↑N ↓N", "commits to push / to pull"),
+            ("↑N ↓N", "commits to push / to pull; ↑ marks an unpushed commit"),
             ("✓", "in sync with its upstream"),
             ("!", "sync all couldn't pull it; the reason is in SUMMARY"),
         ],
@@ -267,9 +336,9 @@ fn help_section(lines: &mut Vec<Line<'static>>, title: &str, keys: &[(&str, &str
 fn help(f: &mut Frame, area: Rect, scroll: u16) -> u16 {
     let two = area.width >= 110;
     let (mut left, mut right) = (Vec::new(), Vec::new());
-    // Two columns of about equal height: the list and diff keys left, the rest right.
-    for (i, (title, keys)) in HELP.iter().enumerate() {
-        let side = if two && ![0, 2].contains(&i) { &mut right } else { &mut left };
+    // Two columns of about equal height: the repo list and recent commits keys left, the rest right.
+    for (title, keys) in HELP {
+        let side = if two && !["Repo list", "Recent commits"].contains(title) { &mut right } else { &mut left };
         help_section(side, title, keys);
     }
     let width = if two { area.width.saturating_sub(4).min(124) } else { area.width.saturating_sub(2).min(72) };
@@ -344,6 +413,19 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("A", "agent"),
             ("?", "all keys"),
         ],
+        View::Commits => &[
+            ("⏎", "open commit / unfold repo"),
+            ("[ ]", "period"),
+            ("tab", "repos"),
+            ("/", "filter"),
+            ("t", "shell"),
+            ("A", "agent"),
+            ("?", "all keys"),
+            ("q", "quit"),
+        ],
+        View::Diff { ref back, .. } if matches!(**back, View::Commits) => {
+            &[("esc", "back"), ("n/p", "next/prev commit"), ("↑↓", "scroll"), ("space", "page"), ("?", "all keys")]
+        }
         View::Diff { .. } => &[("esc", "back"), ("↑↓", "scroll"), ("space", "page"), ("?", "all keys")],
     };
     let mut spans = vec![Span::raw(" ")];
@@ -533,6 +615,221 @@ fn list(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(table, area.inner(Margin::new(0, 1)), &mut app.table_state);
 }
 
+/// `s` cut to `w` terminal columns, with `…` when it doesn't fit. Counts wide characters like emoji as two.
+fn fit(s: &str, w: usize) -> String {
+    if Span::raw(s).width() <= w {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let cw = Span::raw(c.to_string()).width();
+        if used + cw + 1 > w {
+            break;
+        }
+        out.push(c);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+
+fn width(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
+fn first_name(author: &str) -> &str {
+    author.split_whitespace().next().unwrap_or(author)
+}
+
+/// `5 commits · 10m–8h · Peter, Stefan`: how many, over how long, and who, most commits first.
+fn group_meta(app: &App, g: &Group) -> String {
+    let log: Vec<&git::LogCommit> = g.commits.iter().map(|&j| app.commit(g.repo, j)).collect();
+    let n = log.len();
+    let (newest, oldest) = (ago(log[0].ts), ago(log[n - 1].ts));
+    let span = if newest == oldest { newest } else { format!("{newest}–{oldest}") };
+    let mut who: Vec<(&str, usize)> = Vec::new();
+    for c in &log {
+        match who.iter_mut().find(|(a, _)| *a == c.author) {
+            Some((_, k)) => *k += 1,
+            None => who.push((&c.author, 1)),
+        }
+    }
+    who.sort_by_key(|&(_, k)| Reverse(k));
+    let mut names: Vec<&str> = who.iter().take(3).map(|&(a, _)| first_name(a)).collect();
+    let extra = who.len().saturating_sub(3).to_string();
+    if who.len() > 3 {
+        names.push(&extra);
+    }
+    format!("{n} commit{} · {span} · {}", if n == 1 { "" } else { "s" }, names.join(", "))
+}
+
+/// Below these widths the board leaves out the files count, then the author, so the message keeps room.
+const FILES_MIN_WIDTH: usize = 100;
+const AUTHOR_MIN_WIDTH: usize = 80;
+
+/// The recent-commits board: every repo with commits in the period, the one with the newest commit first, each
+/// heading its newest commits. Sizes line up on the right; authors show only for commits that aren't yours.
+fn commits(f: &mut Frame, area: Rect, app: &mut App) {
+    let (groups, rows, pos) = app.board_pos();
+    let [bar, _, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]).areas(area.inner(Margin::new(1, 0)));
+    let total: usize = groups.iter().map(|g| g.commits.len()).sum();
+    let mut top = vec![format!("{}   ", app.period.title()).bold()];
+    for (k, p) in Period::ALL.iter().enumerate() {
+        if k > 0 {
+            top.push(" · ".dark_gray());
+        }
+        top.push(if *p == app.period { format!("[{}]", p.label()).cyan().bold() } else { p.label().dark_gray() });
+    }
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+    top.push(format!("      {} repo{} · {total} commit{}", groups.len(), s(groups.len()), s(total)).dark_gray());
+    let hint = "      [ ] or 1–4 change the period".dark_gray();
+    if width(&top) + hint.width() <= bar.width as usize {
+        top.push(hint);
+    }
+    f.render_widget(Line::from(top), bar);
+
+    if rows.is_empty() {
+        let msg = if app.repos.iter().any(|r| r.busy) {
+            format!("{} Reading commits in {} repos…", spin(app.tick), app.repos.len())
+        } else if !app.filter.is_empty() {
+            format!("No commit matches /{} in this period", app.filter)
+        } else if app.period != Period::Week {
+            format!("No commits: {}. ] looks further back.", app.period.title().to_lowercase())
+        } else {
+            format!("No commits in the last {} days.", git::RECENT_DAYS)
+        };
+        let [_, mid, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)]).areas(body);
+        f.render_widget(Line::from(msg).centered(), mid);
+        return;
+    }
+
+    // Two columns go to the selection bar.
+    let w = (body.width as usize).saturating_sub(2);
+    let (show_files, show_author) = (w >= FILES_MIN_WIDTH, w >= AUTHOR_MIN_WIDTH);
+    let me = app.me.clone();
+    let others = |c: &git::LogCommit| show_author && me.as_deref() != Some(c.author.as_str());
+    // Column widths for the right-hand side, so sizes and authors line up across every repo.
+    let totals: Vec<git::Size> = groups
+        .iter()
+        .map(|g| {
+            g.commits.iter().map(|&j| app.commit(g.repo, j).size).fold(git::Size::default(), |t, s| git::Size {
+                files: 0,
+                added: t.added + s.added,
+                removed: t.removed + s.removed,
+            })
+        })
+        .collect();
+    let shown: Vec<&git::LogCommit> =
+        rows.iter().filter_map(|r| if let BoardRow::Commit(i, j) = *r { Some(app.commit(i, j)) } else { None }).collect();
+    let files = |s: git::Size| format!("{} file{}", s.files, if s.files == 1 { "" } else { "s" });
+    let aw = shown.iter().map(|c| c.size.added).chain(totals.iter().map(|t| t.added)).max().unwrap_or(0).to_string().len() + 1;
+    let rw = shown.iter().map(|c| c.size.removed).chain(totals.iter().map(|t| t.removed)).max().unwrap_or(0).to_string().len() + 1;
+    let fw = if show_files { shown.iter().map(|c| files(c.size).len()).max().unwrap_or(0) } else { 0 };
+    // The unpushed marker gets a column only when there is one to show.
+    let any_unpushed = shown.iter().any(|c| c.unpushed);
+    let who_w = shown.iter().filter(|c| others(c)).map(|c| Span::raw(fit(first_name(&c.author), 12)).width()).max().unwrap_or(0);
+    let lines_cell = |s: git::Size, bold: bool| -> Vec<Span<'static>> {
+        let (a, r) = (format!("{:>aw$}", format!("+{}", s.added)), format!("{:>rw$}", format!("−{}", s.removed)));
+        if bold {
+            vec![a.green().bold(), " ".into(), r.red().bold()]
+        } else {
+            vec![a.green(), " ".into(), r.red()]
+        }
+    };
+    // A row's left side, cut to leave room for its right side, then padded so the right side ends at the edge.
+    let join = |mut left: Vec<Span<'static>>, right: Vec<Span<'static>>, cut: usize| -> Line<'static> {
+        let room = w.saturating_sub(width(&right) + 2);
+        if width(&left) > room {
+            // Only the last span (the message or the summary) gets shortened.
+            if let Some(last) = left.pop() {
+                let keep = room.saturating_sub(width(&left)).max(cut.min(room));
+                left.push(Span::styled(fit(&last.content, keep), last.style));
+            }
+        }
+        let gap = w.saturating_sub(width(&left) + width(&right));
+        left.push(" ".repeat(gap).into());
+        left.extend(right);
+        Line::from(left)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut sel_line = 0;
+    for (k, &row) in rows.iter().enumerate() {
+        let line = match row {
+            BoardRow::Repo(i) => {
+                if k > 0 {
+                    lines.push(Line::raw(""));
+                }
+                let g = groups.iter().position(|g| g.repo == i).expect("every repo row has a group");
+                let r = &app.repos[i];
+                let arrived = groups[g].commits.iter().filter_map(|&j| app.commit(i, j).arrived).max();
+                let (dir, leaf) = r.name.rsplit_once('/').map_or(("", r.name.as_str()), |(d, l)| (d, l));
+                let mut left = vec![fresh_mark(arrived), " ".into()];
+                if !dir.is_empty() {
+                    left.push(format!("{dir}/").dark_gray());
+                }
+                left.push(leaf.to_string().bold());
+                let unpushed = groups[g].commits.iter().filter(|&&j| app.commit(i, j).unpushed).count();
+                if unpushed > 0 {
+                    left.push(format!("  ↑{unpushed} unpushed").cyan().bold());
+                }
+                left.push("   ".into());
+                left.push(group_meta(app, &groups[g]).dark_gray());
+                join(left, lines_cell(totals[g], true), 10)
+            }
+            BoardRow::Commit(i, j) => {
+                let c = app.commit(i, j);
+                let mut left = vec!["   ".into(), fresh_mark(c.arrived), format!("{:>4}  ", ago(c.ts)).dark_gray()];
+                if any_unpushed {
+                    left.push(if c.unpushed { "↑ ".cyan().bold() } else { "  ".into() });
+                }
+                if !matches!(&app.repos[i].status, Some(Ok(s)) if s.branch == c.branch) {
+                    left.push(fit(&c.branch, 28).magenta());
+                    left.push("  ".into());
+                }
+                left.push(emojify(&c.subject).into());
+                let mut right = Vec::new();
+                if who_w > 0 {
+                    let who = if others(c) { fit(first_name(&c.author), 12) } else { String::new() };
+                    right.push(format!("{who:<who_w$}   "));
+                }
+                let mut right: Vec<Span<'static>> = right.into_iter().map(Span::raw).collect();
+                if show_files {
+                    right.push(format!("{:>fw$}  ", files(c.size)).dark_gray());
+                }
+                right.extend(lines_cell(c.size, false));
+                join(left, right, 20)
+            }
+            BoardRow::More(_, n) => Line::from(format!("          … {n} more  (⏎ shows them)").dark_gray()),
+        };
+        let selected = k == pos;
+        if selected {
+            sel_line = lines.len();
+        }
+        let mut spans = vec![if selected { "▌ ".cyan().bold() } else { "  ".into() }];
+        spans.extend(line.spans);
+        let line = Line::from(spans);
+        lines.push(if selected { line.style(Style::new().bg(SELECTED_BG)) } else { line });
+    }
+
+    // Keep the selection on screen, and its repo's header too when the selection is that repo's first commit.
+    let height = body.height as usize;
+    let mut scroll = app.board_scroll.min(lines.len().saturating_sub(1));
+    let want_top = if pos > 0 && matches!(rows[pos - 1], BoardRow::Repo(_)) { sel_line - 1 } else { sel_line };
+    if want_top < scroll {
+        scroll = want_top.saturating_sub(1);
+    } else if sel_line >= scroll + height {
+        scroll = sel_line + 1 - height;
+    }
+    if pos == 0 {
+        scroll = 0;
+    }
+    app.board_scroll = scroll;
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+}
+
 fn section(lines: &mut Vec<Line<'static>>, title: String, hint: &str) {
     lines.push(Line::raw(""));
     let hint = if hint.is_empty() { String::new() } else { format!("  ({hint})") };
@@ -643,7 +940,7 @@ fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>
                 a => format!("{a} ago  "),
             }
             .into(),
-            s.last_commit_subject.clone().italic(),
+            emojify(&s.last_commit_subject).italic(),
         ]));
     }
     let mut totals = vec![format!("{} files changed   ", s.files.len()).into()];
@@ -688,7 +985,7 @@ fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>
             let selected = sel == Some(items.len());
             items.push(lines.len());
             lines.push(item_line(
-                vec![hash.to_string().magenta(), " ".into(), format!("{age:>3} ").dark_gray(), msg.to_string().into()],
+                vec![hash.to_string().magenta(), " ".into(), format!("{age:>3} ").dark_gray(), emojify(msg).into()],
                 selected,
             ));
         }
@@ -703,7 +1000,7 @@ fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>
             let (hash, msg) = c.split_once(' ').unwrap_or((c, ""));
             let selected = sel == Some(items.len());
             items.push(lines.len());
-            lines.push(item_line(vec![hash.to_string().yellow(), " ".into(), msg.to_string().into()], selected));
+            lines.push(item_line(vec![hash.to_string().yellow(), " ".into(), emojify(msg).into()], selected));
         }
         if s.unpushed_count as usize > s.unpushed.len() {
             lines.push(Line::from(format!("… and {} more", s.unpushed_count as usize - s.unpushed.len()).dark_gray()));
@@ -919,4 +1216,18 @@ fn diff(f: &mut Frame, area: Rect, title: &str, lines: &[String], scroll: u16) {
         top,
     );
     f.render_widget(Paragraph::new(shown).block(Block::new().padding(Padding::horizontal(1))), rest);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gitmoji_shortcodes_become_emoji() {
+        assert_eq!(emojify(":wrench: New versions release automatically"), "🔧 New versions release automatically");
+        assert_eq!(emojify(":sparkles::bug: Both"), "✨🐛 Both");
+        // Times, unknown codes and stray colons stay as written.
+        assert_eq!(emojify("Meet at 10:30: :nope: and a:b"), "Meet at 10:30: :nope: and a:b");
+        assert_eq!(emojify("ends with :"), "ends with :");
+    }
 }

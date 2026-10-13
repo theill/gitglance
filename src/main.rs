@@ -5,6 +5,7 @@ mod ui;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,8 @@ Press c to commit everything in a repo (Claude drafts the message) and push,
 P to push commits that are already made, or u to pull in commits you are behind on.
 Press U (shift+u) to fetch and pull updates in every non-ignored repo.
 Press t for a shell in the selected repo; exit it to come back.
+Press tab for the repos with new commits in the last 24 hours (or hour, today, 7 days), live;
+enter shows a commit.
 
 Press A to start a Claude Code session in the selected repo, or R to resume the last
 one there (claude --continue). It opens in a new terminal window (xdg-terminal-exec,
@@ -81,6 +84,8 @@ pub struct Repo {
     pub ignored: bool,
     /// Why the last sync all couldn't pull this repo; cleared by the next sync or a successful Git operation.
     pub sync_issue: Option<String>,
+    /// The newest commits on any branch, for the recent-commits view; `None` until a scan could read them.
+    pub log: Option<Vec<git::LogCommit>>,
 }
 
 impl Repo {
@@ -106,6 +111,7 @@ impl Repo {
             activity: None,
             ignored: false,
             sync_issue: None,
+            log: None,
         }
     }
 
@@ -132,6 +138,7 @@ enum Msg {
         gen: u64,
         quiet: bool,
         status: Box<Result<git::Status, String>>,
+        log: Result<Vec<git::LogCommit>, String>,
         context: Option<String>,
         cached: Option<String>,
     },
@@ -185,6 +192,86 @@ pub enum View {
     /// `sel` indexes `detail_items`; `None` means nothing is highlighted yet.
     Detail { path: PathBuf, scroll: u16, sel: Option<usize> },
     Diff { title: String, lines: Vec<String>, scroll: u16, back: Box<View> },
+    /// The newest commits across every repo, newest first (see `App::feed`).
+    Commits,
+}
+
+/// How far back the recent-commits board looks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Period {
+    Hour,
+    Today,
+    Day,
+    Week,
+}
+
+impl Period {
+    pub const ALL: [Period; 4] = [Period::Hour, Period::Today, Period::Day, Period::Week];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Period::Hour => "1h",
+            Period::Today => "today",
+            Period::Day => "24h",
+            Period::Week => "7d",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Period::Hour => "Last hour",
+            Period::Today => "Today",
+            Period::Day => "Last 24 hours",
+            Period::Week => "Last 7 days",
+        }
+    }
+
+    /// The oldest commit time that counts, given the local time zone's offset from UTC in seconds.
+    pub fn start(self, now: i64, utc_offset: i64) -> i64 {
+        match self {
+            Period::Hour => now - 3_600,
+            Period::Today => now - (now + utc_offset).rem_euclid(86_400),
+            Period::Day => now - 86_400,
+            Period::Week => now - git::RECENT_DAYS as i64 * 86_400,
+        }
+    }
+
+    fn step(self, delta: isize) -> Period {
+        let i = Period::ALL.iter().position(|&p| p == self).unwrap_or(0) as isize;
+        Period::ALL[(i + delta).clamp(0, Period::ALL.len() as isize - 1) as usize]
+    }
+}
+
+/// A row on the recent-commits board.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BoardRow {
+    /// A repo with commits in the period, heading them.
+    Repo(usize),
+    /// A commit: the repo, and its index in that repo's `log`.
+    Commit(usize, usize),
+    /// A folded repo's commits that aren't shown: the repo, and how many.
+    More(usize, usize),
+}
+
+/// What a board row shows, so the selection can follow it when rows move.
+#[derive(PartialEq)]
+enum Pick {
+    Repo(PathBuf),
+    Commit(PathBuf, String),
+    More(PathBuf),
+}
+
+/// A repo on the board, with its commits in the period as indexes into its `log`, newest first.
+pub struct Group {
+    pub repo: usize,
+    pub commits: Vec<usize>,
+}
+
+/// How many commits a repo shows on the board until it's unfolded.
+pub const FOLDED: usize = 3;
+
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 pub struct SyncProgress {
@@ -228,6 +315,16 @@ pub struct App {
     sel_path: Option<PathBuf>,
     last_pos: usize,
     pub table_state: TableState,
+    /// The recent-commits board: its period, the repos unfolded on it, and its selection (with the row as a fallback).
+    pub period: Period,
+    utc_offset: i64,
+    expanded: HashSet<PathBuf>,
+    board_sel: Option<Pick>,
+    last_board_pos: usize,
+    /// The board's first visible line, kept so the selection stays on screen without the page jumping.
+    pub board_scroll: usize,
+    /// Your git `user.name`, so the recent-commits view can tell your commits from your teammates'.
+    pub me: Option<String>,
     pub view: View,
     pub modal: Option<Modal>,
     /// Repos with a commit message being drafted right now.
@@ -280,6 +377,7 @@ impl App {
             });
         }
         let ignore_file = ignore::Ignore::load(&root);
+        let me = git::git(&root, &["config", "user.name"]).ok().map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
         let home = std::env::var("HOME").unwrap_or_default();
         let shown = root.to_string_lossy().into_owned();
         let root_display = match shown.strip_prefix(&home) {
@@ -300,6 +398,13 @@ impl App {
             sel_path: None,
             last_pos: 0,
             table_state: TableState::default(),
+            period: Period::Day,
+            utc_offset: git::utc_offset(),
+            expanded: HashSet::new(),
+            board_sel: None,
+            last_board_pos: 0,
+            board_scroll: 0,
+            me,
             view: View::List,
             modal: None,
             drafting: HashSet::new(),
@@ -366,6 +471,149 @@ impl App {
         self.repos.iter().position(|r| r.path == path)
     }
 
+    /// The repos with commits in the board's period, the one with the newest commit first, each with its commits
+    /// newest first. A commit that several repos share, like a repo and its linked worktrees, is listed once, under
+    /// the repo that has its branch checked out if one does. The filter matches the repo, author, branch or message.
+    pub fn groups(&self) -> Vec<Group> {
+        let since = self.period.start(unix_now(), self.utc_offset);
+        let f = self.filter.to_lowercase();
+        let checked_out = |i: usize, c: &git::LogCommit| matches!(&self.repos[i].status, Some(Ok(s)) if s.branch == c.branch);
+        let mut picked: Vec<(usize, usize)> = Vec::new();
+        let mut at: HashMap<&str, usize> = HashMap::new();
+        for (i, r) in self.repos.iter().enumerate() {
+            let Some(log) = r.log.as_ref().filter(|_| !r.ignored) else { continue };
+            for (j, c) in log.iter().enumerate().take_while(|(_, c)| c.ts >= since) {
+                let fields = [&r.name, &c.author, &c.branch, &c.subject];
+                if !f.is_empty() && !fields.iter().any(|s| s.to_lowercase().contains(&f)) {
+                    continue;
+                }
+                match at.get(c.hash.as_str()) {
+                    Some(&k) => {
+                        if checked_out(i, c) && !checked_out(picked[k].0, c) {
+                            picked[k] = (i, j);
+                        }
+                    }
+                    None => {
+                        at.insert(&c.hash, picked.len());
+                        picked.push((i, j));
+                    }
+                }
+            }
+        }
+        // Each log is newest first, so every group is too.
+        let mut groups: Vec<Group> = Vec::new();
+        for (i, j) in picked {
+            match groups.iter_mut().find(|g| g.repo == i) {
+                Some(g) => g.commits.push(j),
+                None => groups.push(Group { repo: i, commits: vec![j] }),
+            }
+        }
+        groups.sort_by_key(|g| Reverse(self.commit(g.repo, g.commits[0]).ts));
+        groups
+    }
+
+    /// The board's rows: each repo, then its newest `FOLDED` commits (all of them once expanded) and how many more.
+    pub fn board(&self) -> (Vec<Group>, Vec<BoardRow>) {
+        let groups = self.groups();
+        let mut rows = Vec::new();
+        for g in &groups {
+            rows.push(BoardRow::Repo(g.repo));
+            let shown = if self.expanded.contains(&self.repos[g.repo].path) { g.commits.len() } else { g.commits.len().min(FOLDED) };
+            rows.extend(g.commits[..shown].iter().map(|&j| BoardRow::Commit(g.repo, j)));
+            if shown < g.commits.len() {
+                rows.push(BoardRow::More(g.repo, g.commits.len() - shown));
+            }
+        }
+        (groups, rows)
+    }
+
+    pub fn commit(&self, i: usize, j: usize) -> &git::LogCommit {
+        &self.repos[i].log.as_ref().expect("board rows point at a loaded log")[j]
+    }
+
+    /// What a row is, independent of where it sits, so the selection can follow it.
+    fn pick(&self, row: BoardRow) -> Pick {
+        match row {
+            BoardRow::Repo(i) => Pick::Repo(self.repos[i].path.clone()),
+            BoardRow::Commit(i, j) => Pick::Commit(self.repos[i].path.clone(), self.commit(i, j).hash.clone()),
+            BoardRow::More(i, _) => Pick::More(self.repos[i].path.clone()),
+        }
+    }
+
+    /// Like `select_pos`: the selection follows the row, so it stays put while new commits come in above it.
+    pub fn board_pos(&mut self) -> (Vec<Group>, Vec<BoardRow>, usize) {
+        let (groups, rows) = self.board();
+        let pos = self
+            .board_sel
+            .as_ref()
+            .and_then(|p| rows.iter().position(|&r| self.pick(r) == *p))
+            .unwrap_or(self.last_board_pos.min(rows.len().saturating_sub(1)));
+        self.last_board_pos = pos;
+        (groups, rows, pos)
+    }
+
+    fn move_board(&mut self, delta: isize) {
+        let (_, rows, pos) = self.board_pos();
+        if rows.is_empty() {
+            return;
+        }
+        let np = (pos as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
+        self.board_sel = Some(self.pick(rows[np]));
+        self.last_board_pos = np;
+    }
+
+    /// ⏎ on the board: a commit opens as `git show`, a repo folds or unfolds, and "… more" unfolds.
+    fn board_enter(&mut self) {
+        let (_, rows, pos) = self.board_pos();
+        match rows.get(pos) {
+            Some(&BoardRow::Commit(i, j)) => self.open_board_commit(i, j),
+            Some(&BoardRow::Repo(i)) => {
+                let path = self.repos[i].path.clone();
+                if !self.expanded.remove(&path) {
+                    self.expanded.insert(path);
+                }
+            }
+            Some(&BoardRow::More(i, _)) => {
+                self.expanded.insert(self.repos[i].path.clone());
+            }
+            None => {}
+        }
+    }
+
+    fn open_board_commit(&mut self, i: usize, j: usize) {
+        let (r, c) = (&self.repos[i], self.commit(i, j));
+        let title = format!("{} · {} · {}", r.name, c.short, ui::emojify(&c.subject));
+        let text = git::show(&r.path, &c.hash);
+        self.show_text(title, text);
+    }
+
+    /// n/p on a commit page opened from the board: the next or previous commit there, past repo headers. Stays on
+    /// the commit it was on when there is none.
+    fn step_commit(&mut self, delta: isize) {
+        let (_, rows, pos) = self.board_pos();
+        let mut k = pos as isize + delta;
+        while (0..rows.len() as isize).contains(&k) && !matches!(rows[k as usize], BoardRow::Commit(..)) {
+            k += delta;
+        }
+        let k = if (0..rows.len() as isize).contains(&k) { k as usize } else { pos };
+        if let Some(&BoardRow::Commit(i, j)) = rows.get(k) {
+            self.board_sel = Some(self.pick(rows[k]));
+            self.last_board_pos = k;
+            self.open_board_commit(i, j);
+        }
+    }
+
+    fn set_period(&mut self, period: Period) {
+        self.period = period;
+        self.board_scroll = 0;
+    }
+
+    /// The repo a board row belongs to, for the keys that act on a repo.
+    fn board_repo(&mut self) -> Option<usize> {
+        let (_, rows, pos) = self.board_pos();
+        rows.get(pos).map(|&(BoardRow::Repo(i) | BoardRow::Commit(i, _) | BoardRow::More(i, _))| i)
+    }
+
     /// A quiet rescan is the live refresh: no spinners, no notice, and it skips repos that are already being scanned.
     fn rescan(&mut self, fetch: bool, quiet: bool) {
         if self.syncing.is_some() {
@@ -420,6 +668,7 @@ impl App {
                     let _ = git::fetch(&path);
                 }
                 let status = git::status(&path);
+                let log = git::recent(&path);
                 let (context, cached) = match &status {
                     Ok(s) if s.needs_attention() => {
                         let c = ai::build_context(&path, s);
@@ -428,7 +677,7 @@ impl App {
                     }
                     _ => (None, None),
                 };
-                if tx.send(Msg::Scanned { path, gen, quiet, status: Box::new(status), context, cached }).is_err() {
+                if tx.send(Msg::Scanned { path, gen, quiet, status: Box::new(status), log, context, cached }).is_err() {
                     break;
                 }
             });
@@ -826,6 +1075,18 @@ impl App {
         }
     }
 
+    fn toggle_live(&mut self) {
+        self.live = !self.live;
+        if self.live {
+            self.rescan(false, true);
+        }
+        self.notice = Some(if self.live {
+            format!("Live: re-checking every {}s, w pauses", self.interval.as_secs())
+        } else {
+            "Paused: the list only changes when you press r or f, w resumes".into()
+        });
+    }
+
     /// The terminal window title, so pending work shows in a taskbar or tab bar without looking at the window.
     fn window_title(&self) -> String {
         let pending = self.repos.iter().filter(|r| r.attention()).count();
@@ -863,7 +1124,7 @@ impl App {
 
     fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Scanned { path, gen, quiet, status, context, cached } => {
+            Msg::Scanned { path, gen, quiet, status, log, context, cached } => {
                 let Some(i) = self.repo_idx(&path) else { return };
                 let r = &mut self.repos[i];
                 if gen != r.gen {
@@ -882,6 +1143,18 @@ impl App {
                 let auto_summary = self.auto_summary;
                 let r = &mut self.repos[i];
                 r.status = Some(status);
+                // A repo with no commits yet, or one git can't read right now, keeps what it had.
+                if let Ok(mut log) = log {
+                    if let Some(old) = &r.log {
+                        for c in &mut log {
+                            c.arrived = match old.iter().find(|o| o.hash == c.hash) {
+                                Some(o) => o.arrived,
+                                None => Some(Instant::now()),
+                            };
+                        }
+                    }
+                    r.log = Some(log);
+                }
                 // A re-check that finds the same changes keeps the summary as it is (a failure message, too).
                 if !quiet || r.context != context {
                     // New changes found in the background get summarized once they settle; each change restarts the wait.
@@ -1058,6 +1331,8 @@ impl App {
                 KeyCode::Backspace => {
                     self.filter.pop();
                 }
+                KeyCode::Down if matches!(self.view, View::Commits) => self.move_board(1),
+                KeyCode::Up if matches!(self.view, View::Commits) => self.move_board(-1),
                 KeyCode::Down => self.move_sel(1),
                 KeyCode::Up => self.move_sel(-1),
                 KeyCode::Char(c) => self.filter.push(c),
@@ -1077,6 +1352,7 @@ impl App {
             View::List => self.list_key(k),
             View::Detail { .. } => self.detail_key(k),
             View::Diff { .. } => self.diff_key(k),
+            View::Commits => self.commits_key(k),
         }
     }
 
@@ -1140,17 +1416,7 @@ impl App {
             }
             KeyCode::Char('r') => self.rescan(false, false),
             KeyCode::Char('f') => self.rescan(true, false),
-            KeyCode::Char('w') => {
-                self.live = !self.live;
-                if self.live {
-                    self.rescan(false, true);
-                }
-                self.notice = Some(if self.live {
-                    format!("Live: re-checking every {}s, w pauses", self.interval.as_secs())
-                } else {
-                    "Paused: the list only changes when you press r or f, w resumes".into()
-                });
-            }
+            KeyCode::Char('w') => self.toggle_live(),
             KeyCode::Char('a') => self.show_all = !self.show_all,
             KeyCode::Char('x') => {
                 if let Some(i) = self.selected_idx() {
@@ -1167,6 +1433,40 @@ impl App {
                 });
             }
             KeyCode::Char('/') => self.filtering = true,
+            KeyCode::Tab | KeyCode::BackTab => self.view = View::Commits,
+            _ => {}
+        }
+        false
+    }
+
+    /// The recent-commits board. Repo keys act on the selected row's repo.
+    fn commits_key(&mut self, k: KeyEvent) -> bool {
+        match k.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Esc if !self.filter.is_empty() => self.filter.clear(),
+            KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab => self.view = View::List,
+            KeyCode::Down | KeyCode::Char('j') => self.move_board(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_board(-1),
+            KeyCode::PageDown => self.move_board(10),
+            KeyCode::PageUp => self.move_board(-10),
+            KeyCode::Home | KeyCode::Char('g') => self.move_board(-1_000_000),
+            KeyCode::End | KeyCode::Char('G') => self.move_board(1_000_000),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.board_enter(),
+            KeyCode::Char(']') => self.set_period(self.period.step(1)),
+            KeyCode::Char('[') => self.set_period(self.period.step(-1)),
+            KeyCode::Char(c @ '1'..='4') => self.set_period(Period::ALL[c as usize - '1' as usize]),
+            KeyCode::Char('/') => self.filtering = true,
+            KeyCode::Char('r') => self.rescan(false, false),
+            KeyCode::Char('f') => self.rescan(true, false),
+            KeyCode::Char('w') => self.toggle_live(),
+            KeyCode::Char('t') | KeyCode::Char('o') | KeyCode::Char('A') | KeyCode::Char('R') => {
+                let Some(i) = self.board_repo() else { return false };
+                match k.code {
+                    KeyCode::Char('t') => self.handoff = Some((self.repos[i].path.clone(), Vec::new())),
+                    KeyCode::Char('o') => self.open_in_file_manager(i),
+                    c => self.open_agent(i, c == KeyCode::Char('R')),
+                }
+            }
             _ => {}
         }
         false
@@ -1266,6 +1566,7 @@ impl App {
 
     /// Scrolling and going back on the diff pages.
     fn diff_key(&mut self, k: KeyEvent) -> bool {
+        let from_feed = matches!(&self.view, View::Diff { back, .. } if matches!(**back, View::Commits));
         let View::Diff { scroll, lines, .. } = &mut self.view else { return false };
         let max = lines.len().saturating_sub(5) as i32;
         let mut scroll_by = |d: i32| *scroll = (*scroll as i32 + d).clamp(0, max.max(0)) as u16;
@@ -1282,6 +1583,10 @@ impl App {
             KeyCode::PageUp => scroll_by(-30),
             KeyCode::Home | KeyCode::Char('g') => scroll_by(-1_000_000),
             KeyCode::End | KeyCode::Char('G') => scroll_by(1_000_000),
+            KeyCode::Char('n') | KeyCode::Char('p') if from_feed => {
+                self.view = View::Commits;
+                self.step_commit(if k.code == KeyCode::Char('n') { 1 } else { -1 });
+            }
             _ => {}
         }
         false
@@ -1515,5 +1820,126 @@ mod tests {
             app.handle(app.rx.recv_timeout(Duration::from_secs(5)).unwrap());
         }
         assert_eq!(issue(&app, "broken"), None);
+    }
+
+    fn settle(app: &mut App) {
+        while app.repos.iter().any(|r| r.busy || r.checking) {
+            app.handle(app.rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+    }
+
+    fn screen(app: &mut App) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()).collect()
+    }
+
+    #[test]
+    fn recent_commits_board_groups_repos_by_newest_commit_and_follows_the_selection() {
+        let dir = git::tests::TestDir::new();
+        let now = unix_now();
+        // Each commit adds a three-line file, at a set time before now.
+        let commit = |repo: &str, author: &str, msg: &str, ago: i64| {
+            let path = dir.0.join(repo);
+            std::fs::write(path.join(format!("{msg}.txt")), "a\nb\nc\n").unwrap();
+            git::git(&path, &["add", "--all"]).unwrap();
+            let out = Command::new("git")
+                .args(["-C", path.to_str().unwrap(), "-c", &format!("user.name={author}"), "-c", "user.email=a@example.com"])
+                .args(["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", msg])
+                .env("GIT_COMMITTER_DATE", format!("@{} +0000", now - ago))
+                .env("GIT_AUTHOR_DATE", format!("@{} +0000", now - ago))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        for name in ["alpha", "beta"] {
+            git::git(&dir.0, &["init", "--quiet", "--initial-branch=main", dir.0.join(name).to_str().unwrap()]).unwrap();
+        }
+        commit("alpha", "Agent", "alpha old", 3 * 86_400);
+        commit("alpha", "Agent", "alpha one", 7_200);
+        commit("beta", "Ana Silva", "beta two", 5_000);
+        commit("alpha", "Agent", "alpha three", 4_000);
+        commit("alpha", "Agent", "alpha four", 3_000);
+        commit("alpha", "Agent", "alpha five", 2_000);
+        let mut app = App::new(dir.0.clone(), 2, false, false, Duration::ZERO, None);
+        app.me = Some("Agent".into());
+        app.rescan(false, false);
+        settle(&mut app);
+        let names = |app: &App| -> Vec<String> {
+            app.board()
+                .1
+                .iter()
+                .map(|&r| match r {
+                    BoardRow::Repo(i) => format!("[{}]", app.repos[i].name),
+                    BoardRow::Commit(i, j) => app.commit(i, j).subject.clone(),
+                    BoardRow::More(_, n) => format!("+{n}"),
+                })
+                .collect()
+        };
+        // The last 24 hours: alpha has the newest commit, so it heads the board, folded to its 3 newest.
+        assert_eq!(names(&app), ["[alpha]", "alpha five", "alpha four", "alpha three", "+1", "[beta]", "beta two"]);
+        let key = |app: &mut App, code: KeyCode| app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(names(&app)[..5], ["[alpha]", "alpha five", "alpha four", "alpha three", "+2"]);
+        for _ in 0..3 {
+            key(&mut app, KeyCode::Char('['));
+        }
+        assert_eq!(app.period, Period::Hour);
+        assert_eq!(names(&app), ["[alpha]", "alpha five", "alpha four"]);
+        key(&mut app, KeyCode::Char(']'));
+        key(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.period, Period::Day);
+
+        let shown = screen(&mut app);
+        let row = |s: &[String], text: &str| s.iter().find(|l| l.contains(text)).cloned().unwrap_or_default();
+        let alpha = row(&shown, "alpha ");
+        assert!(alpha.starts_with(" ▌") && alpha.contains("4 commits") && alpha.contains("+12"), "{shown:#?}");
+        assert!(row(&shown, "beta two").contains("Ana") && !row(&shown, "alpha five").contains("Agent"), "{shown:#?}");
+        assert!(row(&shown, "beta two").contains("1 file") && row(&shown, "beta two").contains("+3"), "{shown:#?}");
+        assert!(!shown.iter().any(|l| l.contains('●')), "nothing is new on the first scan: {shown:#?}");
+
+        // ⏎ on "… 1 more" unfolds alpha; ⏎ on the repo folds it again.
+        for _ in 0..4 {
+            key(&mut app, KeyCode::Down);
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(names(&app)[..6], ["[alpha]", "alpha five", "alpha four", "alpha three", "alpha one", "[beta]"]);
+        key(&mut app, KeyCode::Home);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(names(&app)[4], "+1");
+
+        // Select beta's commit. A new beta commit moves beta to the top; the selection stays on "beta two".
+        key(&mut app, KeyCode::End);
+        commit("beta", "Ana Silva", "beta six", 10);
+        app.rescan(false, true);
+        settle(&mut app);
+        assert_eq!(names(&app)[..3], ["[beta]", "beta six", "beta two"]);
+        let shown = screen(&mut app);
+        assert!(row(&shown, "beta six").contains('●') && row(&shown, "2 commits").contains('●'), "{shown:#?}");
+        assert!(row(&shown, "beta two").starts_with(" ▌"), "{shown:#?}");
+
+        // ⏎ shows the commit; n steps past alpha's header to its newest commit, p comes back; esc returns.
+        key(&mut app, KeyCode::Enter);
+        let title = |app: &App| match &app.view {
+            View::Diff { title, .. } => title.clone(),
+            _ => panic!("expected the commit page"),
+        };
+        assert!(title(&app).starts_with("beta · ") && title(&app).ends_with("beta two"));
+        key(&mut app, KeyCode::Char('n'));
+        assert!(title(&app).ends_with("alpha five"), "{}", title(&app));
+        key(&mut app, KeyCode::Char('p'));
+        assert!(title(&app).ends_with("beta two"), "{}", title(&app));
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::Commits));
+
+        // The filter matches authors too; esc clears it, then goes back to the repo list.
+        app.filter = "ana".into();
+        assert_eq!(names(&app), ["[beta]", "beta six", "beta two"]);
+        key(&mut app, KeyCode::Esc);
+        assert!(app.filter.is_empty() && matches!(app.view, View::Commits));
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::List));
     }
 }
