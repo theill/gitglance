@@ -49,6 +49,7 @@ AI summaries and drafted commit messages are optional. They need the [Claude Cod
 | `U` (Shift+U) | sync every non-ignored repo: fetch and pull updates (fast-forward only) |
 | `d` | everything pending: uncommitted diff, unpushed commits with patches, incoming commits |
 | `a` | toggle repos with changes ↔ all repos |
+| `tab` | the repos with recent commits and what they are, live (see [Recent commits](#recent-commits)) |
 | `/` | filter by name |
 | `x` | ignore this repo (adds it to `.gitglanceignore`); press `x` on an ignored repo to un-ignore it |
 | `I` | show or hide ignored repos |
@@ -75,6 +76,32 @@ Columns: **STATE** `S` staged, `M` modified, `?` untracked, `U` conflicts, `≡`
 The numbers cover all branches and leave out merges. Authors are grouped by `.mailmap` names. The panel loads in the background and updates when new commits land while you look at it.
 
 If the repo has changes and no summary yet, the AI summary starts on its own once the repo has been open for half a second. Paging past repos with `n`/`p`, or backing out right away, sends nothing. `--no-auto-summary` turns this off, so only `s` asks.
+
+## Recent commits
+
+`tab` switches from the repo list to a board of the repos that got commits recently, and what those commits are. It's for keeping an eye on agents and teammates committing across several repos: leave it open, and new commits show up within seconds, with a `●` on the commit and its repo (bright for the first minute, dim `•` for ten).
+
+```
+ Last 24 hours   1h · today · [24h] · 7d      2 repos · 6 commits
+
+ ▌ ● shop/api   5 commits · 2m–8h · Peter, Ana                          +175  −35
+       ●  2m  worktree-auth  Add token refresh to the middleware     3 files   +88  −12
+          1h  Fix the rate limit on login                     Ana    2 files   +40  −10
+          8h  Log the request id with every error             Ana    2 files   +35  −11
+              … 2 more  (⏎ shows them)
+
+     shop/web   1 commit · 3h · Ana                                       +12   −4
+          3h  Fix the cart total rounding                     Ana     1 file   +12   −4
+```
+
+- Each repo with commits in the period gets a line saying how many, over how long, by whom and how big they are in total. The repo with the newest commit comes first, so a repo an agent just committed to moves to the top.
+- Under it are its 3 newest commits, with their size (files and lines added and removed). `⏎` on the repo, or on "… more", shows all of them; `⏎` on the repo again folds them.
+- `[` and `]` (or `1` to `4`) pick the period: the last hour, today, the last 24 hours (the default) or the last 7 days.
+- `⏎` on a commit shows it as `git show`: message, files changed and the full patch. `n`/`p` there steps to the next or previous commit on the board, and Esc goes back.
+- Commits come from local and remote branches, with merges left out, so commits other people push show up after the next fetch (every 5 minutes, or `f`). A commit is prefixed with its branch only when it isn't on the repo's checked-out branch: an agent's worktree branch, a feature branch, or `origin/main` for commits you haven't pulled yet. A commit shared by a repo and its linked worktrees is listed once.
+- Commits you haven't pushed yet are included and marked `↑` (cyan), and the repo line says how many, like `↑2 unpushed`. Repos with no remote aren't marked, since there is nowhere to push them.
+- Authors are named only on commits that aren't yours (your git `user.name`), so teammates stand out. Narrow terminals leave out the files count, then the author.
+- `/` filters by repo, author, branch or message (`/ana`, `/api`). `t`, `A`, `R` and `o` act on the selected row's repo. `tab` or Esc goes back to the repo list.
 
 ## Live dashboard
 

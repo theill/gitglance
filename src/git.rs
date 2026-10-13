@@ -309,6 +309,138 @@ pub fn status(repo: &Path) -> Result<Status, String> {
 /// How many incoming commits the detail page lists; `d` shows them all.
 pub const INCOMING_MAX: usize = 50;
 
+/// One commit in the recent-commits view.
+#[derive(Clone)]
+pub struct LogCommit {
+    pub hash: String,
+    pub short: String,
+    /// Committer time, so a commit that was just rebased or cherry-picked counts as new.
+    pub ts: i64,
+    pub author: String,
+    /// The branch it was reached from: `develop`, `origin/main`, or `HEAD` when detached.
+    pub branch: String,
+    pub subject: String,
+    pub size: Size,
+    /// On a local branch but on no remote branch yet. Never set in a repo without a remote, where nothing is pushed.
+    pub unpushed: bool,
+    /// When a re-check first saw it; `None` for commits that were already there on the first scan.
+    pub arrived: Option<std::time::Instant>,
+}
+
+/// How big a commit is: files changed, lines added and removed.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct Size {
+    pub files: u32,
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// How far back the recent-commits view reads; shorter periods are cut from this in memory.
+pub const RECENT_DAYS: u32 = 7;
+/// A cap per repo, so a repo with a flood of commits can't slow every re-check down.
+const RECENT_MAX: usize = 300;
+
+/// Commits from the last `RECENT_DAYS` days on any local or remote branch, newest first, merges left out.
+///
+/// Local and remote-only commits are read separately, because git names a commit after the first ref that reaches
+/// it: read together, a pushed commit at the tip of `origin/main` would be called `origin/main` even when it is on
+/// the `main` you have checked out, as soon as you have local commits on top of it.
+pub fn recent(repo: &Path) -> Result<Vec<LogCommit>, String> {
+    let since = format!("--since={RECENT_DAYS}.days.ago");
+    let read = |revs: &[&str]| -> Result<Vec<LogCommit>, String> {
+        let max = format!("--max-count={RECENT_MAX}");
+        let mut args = vec!["log", "--no-merges", "--date-order", "--source", &since, &max];
+        args.push("--format=%H%x09%h%x09%ct%x09%aN%x09%S%x09%s");
+        args.extend_from_slice(revs);
+        Ok(git(repo, &args)?.lines().filter_map(parse_log_line).collect())
+    };
+    let mut log = read(&["--branches", "HEAD"])?;
+    let has_remote = git(repo, &["remote"]).is_ok_and(|r| !r.trim().is_empty());
+    if has_remote {
+        let local = git(repo, &["rev-list", &since, "--branches", "HEAD", "--not", "--remotes"]).unwrap_or_default();
+        let local: std::collections::HashSet<&str> = local.lines().collect();
+        for c in &mut log {
+            c.unpushed = local.contains(c.hash.as_str());
+        }
+        // Commits only a remote has: a teammate's branch, or ones you haven't pulled yet.
+        log.extend(read(&["--exclude=*/HEAD", "--remotes", "--not", "--branches", "HEAD"]).unwrap_or_default());
+        // A stable sort keeps git's order among commits made in the same second, so a parent never shows above its child.
+        log.sort_by_key(|c| std::cmp::Reverse(c.ts));
+        log.truncate(RECENT_MAX);
+    }
+    let sizes = sizes(repo, log.iter().map(|c| c.hash.as_str()));
+    for c in &mut log {
+        c.size = sizes.get(&c.hash).copied().unwrap_or_default();
+    }
+    Ok(log)
+}
+
+/// One `%H %h %ct %aN %S %s` line (tab-separated) of `recent`'s log.
+fn parse_log_line(line: &str) -> Option<LogCommit> {
+    let mut p = line.splitn(6, '\t');
+    let (hash, short, ts, author, source) = (p.next()?, p.next()?, p.next()?, p.next()?, p.next()?);
+    let branch = source.strip_prefix("refs/heads/").or_else(|| source.strip_prefix("refs/remotes/")).unwrap_or(source);
+    Some(LogCommit {
+        hash: hash.into(),
+        short: short.into(),
+        ts: ts.parse().ok()?,
+        author: author.into(),
+        branch: branch.into(),
+        subject: p.next().unwrap_or_default().into(),
+        size: Size::default(),
+        unpushed: false,
+        arrived: None,
+    })
+}
+
+/// Commit sizes by hash. A commit never changes, so each one is diffed once per run and remembered.
+fn sizes<'a>(repo: &Path, hashes: impl Iterator<Item = &'a str>) -> std::collections::HashMap<String, Size> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static KNOWN: OnceLock<Mutex<HashMap<String, Size>>> = OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    let hashes: Vec<&str> = hashes.collect();
+    let missing: Vec<&str> = {
+        let k = known.lock().unwrap();
+        hashes.iter().copied().filter(|h| !k.contains_key(*h)).collect()
+    };
+    if !missing.is_empty() {
+        let mut args = vec!["log", "--no-walk=unsorted", "--no-ext-diff", "--no-textconv", "--shortstat", "--format=%x01%H"];
+        args.extend(&missing);
+        if let Ok(out) = git(repo, &args) {
+            let mut k = known.lock().unwrap();
+            let mut current: Option<&str> = None;
+            for line in out.lines() {
+                if let Some(h) = line.strip_prefix('\u{1}') {
+                    // A commit with no changes has no stat line, so it is recorded as empty right away.
+                    k.insert(h.to_string(), Size::default());
+                    current = Some(h);
+                } else if let (Some(h), true) = (current, line.contains("changed")) {
+                    k.insert(h.to_string(), parse_shortstat(line));
+                }
+            }
+        }
+    }
+    let k = known.lock().unwrap();
+    hashes.iter().filter_map(|h| Some((h.to_string(), *k.get(*h)?))).collect()
+}
+
+/// `" 3 files changed, 10 insertions(+), 2 deletions(-)"`
+fn parse_shortstat(line: &str) -> Size {
+    let mut s = Size::default();
+    for part in line.split(',') {
+        let n: u32 = part.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        if part.contains("changed") {
+            s.files = n;
+        } else if part.contains("insertion") {
+            s.added = n;
+        } else if part.contains("deletion") {
+            s.removed = n;
+        }
+    }
+    s
+}
+
 pub fn fetch(repo: &Path) -> Result<String, String> {
     git(repo, &["fetch", "--all", "--prune", "--quiet"])
 }
@@ -614,6 +746,21 @@ pub fn activity(repo: &Path) -> Result<Activity, String> {
     Ok(a)
 }
 
+/// The local time zone's offset from UTC in seconds, from `date +%z` (`+0200`); 0 if that isn't available.
+pub fn utc_offset() -> i64 {
+    let out = Command::new("date").arg("+%z").stderr(Stdio::null()).output().ok();
+    let z = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let (sign, hhmm) = match z.split_at_checked(1) {
+        Some(("-", rest)) => (-1, rest),
+        Some(("+", rest)) => (1, rest),
+        _ => return 0,
+    };
+    match (hhmm.get(..2).and_then(|h| h.parse::<i64>().ok()), hhmm.get(2..4).and_then(|m| m.parse::<i64>().ok())) {
+        (Some(h), Some(m)) => sign * (h * 3_600 + m * 60),
+        _ => 0,
+    }
+}
+
 /// Today's local date as days since 1970-01-01, from `date`; UTC if that isn't available.
 fn local_today() -> i64 {
     Command::new("date")
@@ -807,6 +954,56 @@ pub(crate) mod tests {
         let linked = dir.0.join("linked");
         git(&repo, &["worktree", "add", "--quiet", "-b", "side", linked.to_str().unwrap()]).unwrap();
         assert_eq!(discover(&dir.0, 3), vec![group.join("repo"), linked]);
+    }
+
+    #[test]
+    fn recent_lists_local_and_remote_branches_newest_first_without_merges() {
+        let (_dir, _, local, peer) = setup();
+        git(&local, &["checkout", "--quiet", "-b", "feature"]).unwrap();
+        commit(&local, "feature", "on feature");
+        git(&local, &["checkout", "--quiet", "main"]).unwrap();
+        commit(&local, "local", "on main");
+        let ident = ["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "core.hooksPath=/dev/null"];
+        git(&local, &[&ident[..], &["merge", "--no-ff", "--quiet", "-m", "merge feature", "feature"]].concat()).unwrap();
+        commit(&peer, "incoming", "from a peer");
+        git(&peer, &["push", "--quiet"]).unwrap();
+        git(&local, &["fetch", "--quiet"]).unwrap();
+
+        let log = recent(&local).unwrap();
+        // `base` is on both local branches, so either name is right.
+        let mut got: Vec<(&str, &str)> = log
+            .iter()
+            .map(|c| (c.subject.as_str(), if c.subject == "base" { "" } else { c.branch.as_str() }))
+            .collect();
+        got.sort();
+        assert_eq!(got, [("base", ""), ("from a peer", "origin/main"), ("on feature", "feature"), ("on main", "main")]);
+        assert!(log.windows(2).all(|w| w[0].ts >= w[1].ts));
+        assert!(log.iter().all(|c| c.hash.len() == 40 && c.hash.starts_with(&c.short) && c.author == "Test"));
+        let unpushed: Vec<&str> = log.iter().filter(|c| c.unpushed).map(|c| c.subject.as_str()).collect();
+        assert_eq!(unpushed.len(), 2, "{unpushed:?}");
+        assert!(unpushed.contains(&"on main") && unpushed.contains(&"on feature"));
+        // A repo with no remote has nothing to push, so nothing is marked.
+        git(&local, &["remote", "remove", "origin"]).unwrap();
+        assert!(recent(&local).unwrap().iter().all(|c| !c.unpushed));
+        // Each test commit writes one line to one file.
+        assert!(log.iter().all(|c| c.size == Size { files: 1, added: 1, removed: 0 }), "{:?}", log.iter().map(|c| c.size).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn recent_names_pushed_commits_by_their_local_branch_and_keeps_children_above_parents() {
+        // `base` is pushed and sits at the tip of origin/main, with two local commits on top, all in the same second.
+        let (_dir, _, local, _) = setup();
+        commit(&local, "one", "local one");
+        commit(&local, "two", "local two");
+        let log = recent(&local).unwrap();
+        let got: Vec<(&str, &str, bool)> = log.iter().map(|c| (c.subject.as_str(), c.branch.as_str(), c.unpushed)).collect();
+        assert_eq!(got, [("local two", "main", true), ("local one", "main", true), ("base", "main", false)]);
+    }
+
+    #[test]
+    fn shortstat_lines_parse() {
+        assert_eq!(parse_shortstat(" 3 files changed, 10 insertions(+), 2 deletions(-)"), Size { files: 3, added: 10, removed: 2 });
+        assert_eq!(parse_shortstat(" 1 file changed, 1 deletion(-)"), Size { files: 1, added: 0, removed: 1 });
     }
 
     #[test]
