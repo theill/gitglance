@@ -317,7 +317,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("≡", "stashes"),
             ("↑N ↓N", "commits to push / to pull; ↑ marks an unpushed commit"),
             ("✓", "in sync with its upstream"),
-            ("!", "sync all couldn't pull it; the reason is in SUMMARY"),
+            ("!", "sync all couldn't pull or push it; the reason is in SUMMARY"),
         ],
     ),
 ];
@@ -930,7 +930,7 @@ fn detail_lines(r: &Repo, tick: usize, sel: Option<usize>) -> (Vec<Line<'static>
     }
     lines.push(Line::from(branch));
     if let Some(issue) = &r.sync_issue {
-        lines.push(Line::from(vec!["! ".red().bold(), format!("sync all couldn't pull: {issue}").red()]));
+        lines.push(Line::from(vec!["! ".red().bold(), format!("sync all couldn't sync: {issue}").red()]));
     }
     if let Some(ts) = s.last_commit_ts {
         lines.push(Line::from(vec![

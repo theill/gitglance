@@ -18,6 +18,7 @@ const HELP: &str = "gitglance - overview of pending git changes in every repo be
 
 USAGE:
     gitglance [DIR] [--depth N] [--summarize] [--interval SECS] [--fetch-every MINS]
+    gitglance update   reinstall the latest gitglance from GitHub (needs cargo)
 
     DIR            folder to scan (default: current directory)
     -d, --depth N  how deep to look for repos below DIR (default: 2)
@@ -40,7 +41,7 @@ that repo, never repos nested below it.
 
 Press c to commit everything in a repo (Claude drafts the message) and push,
 P to push commits that are already made, or u to pull in commits you are behind on.
-Press U (shift+u) to fetch and pull updates in every non-ignored repo.
+Press U (shift+u) to sync every non-ignored repo: pull updates, or push commits already made.
 Press t for a shell in the selected repo; exit it to come back.
 Press tab for the repos with new commits in the last 24 hours (or hour, today, 7 days), live;
 enter shows a commit.
@@ -53,6 +54,22 @@ desktop it runs right here. Set GITGLANCE_AGENT_CMD to start something other tha
 AI summaries run `claude -p` (model from GITGLANCE_MODEL, default haiku) and are
 cached in ~/.cache/gitglance. Set GITGLANCE_AI_CMD to use any other command that
 reads a prompt on stdin and prints the answer.";
+
+const REPO_URL: &str = "https://github.com/theill/gitglance";
+
+/// Reinstalls gitglance the way the README installs it; cargo leaves it alone if that commit is already installed.
+fn self_update() -> io::Result<()> {
+    println!("Updating gitglance from {REPO_URL}");
+    match Command::new("cargo").args(["install", "--git", REPO_URL]).status() {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            eprintln!("cargo not found; install Rust from https://rustup.rs, then run gitglance update again");
+            std::process::exit(1)
+        }
+        Err(e) => Err(e),
+    }
+}
 
 pub enum SummaryState {
     None,
@@ -82,7 +99,7 @@ pub struct Repo {
     /// Commit activity for the detail page, loaded when the repo is opened.
     pub activity: Option<Result<git::Activity, String>>,
     pub ignored: bool,
-    /// Why the last sync all couldn't pull this repo; cleared by the next sync or a successful Git operation.
+    /// Why the last sync all couldn't sync this repo; cleared by the next sync or a successful Git operation.
     pub sync_issue: Option<String>,
     /// The newest commits on any branch, for the recent-commits view; `None` until a scan could read them.
     pub log: Option<Vec<git::LogCommit>>,
@@ -277,9 +294,12 @@ pub fn unix_now() -> i64 {
 pub struct SyncProgress {
     pub total: usize,
     pub done: usize,
-    updated: usize,
-    /// Commits pulled in across the updated repos.
-    commits: u32,
+    pulled: usize,
+    /// Commits pulled in across the pulled repos.
+    pulled_commits: u32,
+    pushed: usize,
+    /// Commits pushed across the pushed repos.
+    pushed_commits: u32,
     issues: usize,
 }
 
@@ -287,9 +307,11 @@ impl SyncProgress {
     /// One line for the footer; the repos that need a look carry their own marker in the list.
     fn summary(&self) -> String {
         let mut parts = Vec::new();
-        if self.updated > 0 {
-            let s = if self.commits == 1 { "" } else { "s" };
-            parts.push(format!("{} updated ({} commit{s})", self.updated, self.commits));
+        for (verb, repos, commits) in [("pulled", self.pulled, self.pulled_commits), ("pushed", self.pushed, self.pushed_commits)] {
+            if repos > 0 {
+                let s = if commits == 1 { "" } else { "s" };
+                parts.push(format!("{repos} {verb} ({commits} commit{s})"));
+            }
         }
         if self.issues > 0 {
             parts.push(format!("{} need{} a look (marked !)", self.issues, if self.issues == 1 { "s" } else { "" }));
@@ -960,7 +982,7 @@ impl App {
                 self.operating.insert(r.path.clone());
             }
         }
-        self.syncing = Some(SyncProgress { total: paths.len(), done: 0, updated: 0, commits: 0, issues: 0 });
+        self.syncing = Some(SyncProgress { total: paths.len(), done: 0, pulled: 0, pulled_commits: 0, pushed: 0, pushed_commits: 0, issues: 0 });
         self.notice = None;
         let workers = 8.min(paths.len());
         let jobs = Arc::new(Mutex::new(paths.into_iter().rev().collect::<Vec<_>>()));
@@ -978,11 +1000,12 @@ impl App {
 
     fn sync_done(&mut self, path: PathBuf, result: Result<git::SyncOutcome, String>) {
         self.operating.remove(&path);
-        let pulled = match result {
-            Ok(git::SyncOutcome::Updated(n)) => Some(n),
-            _ => None,
+        let (pulled, pushed) = match result {
+            Ok(git::SyncOutcome::Pulled(n)) => (Some(n), None),
+            Ok(git::SyncOutcome::Pushed(n)) => (None, Some(n)),
+            _ => (None, None),
         };
-        // Up-to-date and updated repos need nothing; neither does one with nothing to sync, like a local-only repo.
+        // Up-to-date, pulled and pushed repos need nothing; neither does one with nothing to sync, like a local-only repo.
         let issue = match result {
             Err(e) => Some(e),
             Ok(git::SyncOutcome::Blocked(m)) => Some(m),
@@ -990,8 +1013,10 @@ impl App {
         };
         if let Some(progress) = &mut self.syncing {
             progress.done += 1;
-            progress.updated += usize::from(pulled.is_some());
-            progress.commits += pulled.unwrap_or(0);
+            progress.pulled += usize::from(pulled.is_some());
+            progress.pulled_commits += pulled.unwrap_or(0);
+            progress.pushed += usize::from(pushed.is_some());
+            progress.pushed_commits += pushed.unwrap_or(0);
             progress.issues += usize::from(issue.is_some());
             if progress.done == progress.total {
                 self.notice = Some(progress.summary());
@@ -1707,6 +1732,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
 }
 
 fn main() -> io::Result<()> {
+    // Only as the first argument, so `gitglance ./update` still scans a folder by that name.
+    if std::env::args().nth(1).as_deref() == Some("update") {
+        return self_update();
+    }
     let mut root = None;
     let mut depth = 2;
     let mut auto = false;

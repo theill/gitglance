@@ -31,7 +31,7 @@ git clone https://github.com/theill/gitglance && cd gitglance
 cargo install --path .
 ```
 
-Run the same command again to update. `cargo uninstall gitglance` removes it.
+To update, run `gitglance update`. It reinstalls the latest version from GitHub with the same `cargo install --git` command, and does nothing if you already have it. (From a checkout, `git pull && cargo install --path .` works too.) `cargo uninstall gitglance` removes it.
 
 AI summaries and drafted commit messages are optional. They need the [Claude Code](https://claude.com/claude-code) CLI (`claude`) on your `PATH`, or another command set through `GITGLANCE_AI_CMD` (see [AI summaries](#ai-summaries)). Everything else works without it.
 
@@ -46,7 +46,7 @@ AI summaries and drafted commit messages are optional. They need the [Claude Cod
 | `c` | commit everything and push (see below) |
 | `P` | push commits that are already made (asks first) |
 | `u` | pull commits you're behind on (see below) |
-| `U` (Shift+U) | sync every non-ignored repo: fetch and pull updates (fast-forward only) |
+| `U` (Shift+U) | sync every non-ignored repo: fetch, then pull updates (fast-forward only) or push local commits |
 | `d` | everything pending: uncommitted diff, unpushed commits with patches, incoming commits |
 | `a` | toggle repos with changes ↔ all repos |
 | `tab` | the repos with recent commits and what they are, live (see [Recent commits](#recent-commits)) |
@@ -157,11 +157,11 @@ Uncommitted changes are stashed for the pull and restored afterwards.
 
 Press `U` (Shift+U) in the list or detail view to sync every non-ignored repository in the scanned folder, including repos hidden by a filter or by the changes-only view. It discovers new repos first and waits for current scans and Git operations to finish.
 
-The batch runs in the background, with progress in the header. Each repo fetches all remotes and fast-forwards its current branch from its upstream if needed. Local commits stay unpushed. Local changes stay uncommitted. Your live AI-summary settings still apply when repo status changes.
+The batch runs in the background, with progress in the header. Each repo fetches all remotes, then fast-forwards its current branch if it is behind its upstream, or pushes it if it is ahead. Only commits you've already made are pushed; uncommitted changes stay uncommitted. Branches without an upstream aren't published. Your live AI-summary settings still apply when repo status changes.
 
-Repos with diverged branches, conflicts, an unfinished Git operation, a missing upstream, or local edits that would need to be stashed before pulling are not pulled. Use `u` for a diverged branch, or commit/stash edits, then sync again. Repos with no remote, no commits, or detached HEAD are quietly skipped. A failure in one repo doesn't stop the rest.
+Repos with diverged branches, conflicts, an unfinished Git operation, a missing upstream, or local edits that would need to be stashed before pulling are left alone. Use `u` for a diverged branch, or commit/stash edits, then sync again. Repos with no remote, no commits, or detached HEAD are quietly skipped. A failure in one repo doesn't stop the rest.
 
-When the batch finishes you stay where you were, and the footer sums it up (e.g. `Synced 14 repos: 2 updated, 1 needs a look (marked !)`). Updated repos simply refresh in the list. A repo that failed or couldn't be pulled gets a red `!` in SYNC and the reason in SUMMARY, and stays listed even if it has no pending changes. The detail page shows the reason too. The marker clears on the next sync or after a successful commit, push or pull in that repo.
+When the batch finishes you stay where you were, and the footer sums it up (e.g. `Synced 14 repos: 2 pulled (5 commits), 1 pushed (1 commit), 1 needs a look (marked !)`). Pulled and pushed repos simply refresh in the list. A repo that failed or couldn't be synced, including a rejected push, gets a red `!` in SYNC and the reason in SUMMARY, and stays listed even if it has no pending changes. The detail page shows the reason too. The marker clears on the next sync or after a successful commit, push or pull in that repo.
 
 ## Ignoring repos
 

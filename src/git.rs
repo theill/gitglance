@@ -447,15 +447,17 @@ pub fn fetch(repo: &Path) -> Result<String, String> {
 
 pub enum SyncOutcome {
     /// Fast-forwarded over this many commits.
-    Updated(u32),
+    Pulled(u32),
+    /// Pushed this many local commits to the upstream.
+    Pushed(u32),
     UpToDate,
     /// Nothing to sync (no commits, no remote, detached HEAD or no upstream); not a problem.
     Skipped,
-    /// Something in the repo stopped the pull and needs a look.
+    /// Something in the repo stopped the sync and needs a look.
     Blocked(String),
 }
 
-/// Fetch and fast-forward the current branch without committing edits or rebasing unattended.
+/// Fetch, then fast-forward a branch that is behind or push one that is ahead, without committing edits or rebasing unattended.
 pub fn sync(repo: &Path) -> Result<SyncOutcome, String> {
     let s = status(repo)?;
     if s.initial {
@@ -488,12 +490,17 @@ pub fn sync(repo: &Path) -> Result<SyncOutcome, String> {
     if s.behind > 0 && s.dirty() {
         return Ok(SyncOutcome::Blocked("commit or stash local changes before pulling".into()));
     }
-    if s.behind == 0 {
-        return Ok(SyncOutcome::UpToDate);
+    if s.behind > 0 {
+        // Integrate the upstream we just fetched. No second fetch or automatic stash is needed.
+        git(repo, &["merge", "--ff-only", "--quiet", "@{u}"]).map_err(|e| format!("fast-forward failed: {e}"))?;
+        return Ok(SyncOutcome::Pulled(s.behind));
     }
-    // Integrate the upstream we just fetched. No second fetch or automatic stash is needed.
-    git(repo, &["merge", "--ff-only", "--quiet", "@{u}"]).map_err(|e| format!("fast-forward failed: {e}"))?;
-    Ok(SyncOutcome::Updated(s.behind))
+    if s.ahead > 0 {
+        // Only commits are pushed; uncommitted edits stay in the working tree.
+        push(repo, &s).map_err(|e| format!("push failed: {e}"))?;
+        return Ok(SyncOutcome::Pushed(s.ahead));
+    }
+    Ok(SyncOutcome::UpToDate)
 }
 
 fn git_path_exists(repo: &Path, name: &str) -> bool {
@@ -862,26 +869,37 @@ pub(crate) mod tests {
         commit(&peer, "incoming", "incoming");
         git(&peer, &["push"]).unwrap();
         assert_eq!(status(&local).unwrap().behind, 0, "counts are stale before fetch");
-        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Updated(1)));
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Pulled(1)));
         assert_eq!(head(&local), head(&peer));
         assert!(matches!(sync(&local).unwrap(), SyncOutcome::UpToDate));
     }
 
     #[test]
-    fn sync_leaves_local_commits_unpushed_and_preserves_staged_and_untracked_edits() {
+    fn sync_pushes_local_commits_but_leaves_staged_and_untracked_edits_uncommitted() {
         let (_dir, remote, local, _) = setup();
-        let remote_head = head(&remote);
         commit(&local, "outgoing", "outgoing");
+        commit(&local, "outgoing2", "outgoing2");
         std::fs::write(local.join("base"), "uncommitted").unwrap();
         git(&local, &["add", "base"]).unwrap();
         std::fs::write(local.join("untracked"), "untracked").unwrap();
         let before = git(&local, &["status", "--porcelain"]).unwrap();
         let local_head = head(&local);
-        assert!(matches!(sync(&local).unwrap(), SyncOutcome::UpToDate));
-        assert_eq!(head(&remote), remote_head);
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::Pushed(2)));
+        assert_eq!(head(&remote), local_head);
         assert_eq!(head(&local), local_head);
         assert_eq!(git(&local, &["status", "--porcelain"]).unwrap(), before);
         assert_eq!(std::fs::read_to_string(local.join("base")).unwrap(), "uncommitted");
+        assert!(matches!(sync(&local).unwrap(), SyncOutcome::UpToDate));
+    }
+
+    #[test]
+    fn sync_reports_push_failures() {
+        let (dir, remote, local, _) = setup();
+        let remote_head = head(&remote);
+        commit(&local, "outgoing", "outgoing");
+        git(&local, &["remote", "set-url", "--push", "origin", dir.0.join("missing.git").to_str().unwrap()]).unwrap();
+        assert!(sync(&local).err().unwrap().contains("push failed"));
+        assert_eq!(head(&remote), remote_head);
     }
 
     #[test]
