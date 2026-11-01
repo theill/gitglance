@@ -1,6 +1,6 @@
 [package]
 name = "gitglance"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Fast TUI overview of pending git changes across all repos in a folder, with AI summaries"
 
