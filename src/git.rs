@@ -174,14 +174,22 @@ fn is_repo(p: &Path) -> bool {
 }
 
 /// Where a linked worktree keeps its HEAD, index and refs: its own folder in the main repo's `.git`, and that `.git`.
-/// Empty for an ordinary repo, whose `.git` is inside it.
+/// Empty for an ordinary repo, whose `.git` is inside it, and for a `.git` file that doesn't point at that layout
+/// (`<main>/.git/worktrees/<name>`), so a hand-made one can't get `/` or the home folder watched.
 pub fn linked_git_dirs(repo: &Path) -> Vec<PathBuf> {
     let Ok(s) = std::fs::read_to_string(repo.join(".git")) else { return Vec::new() };
     let Some(gitdir) = s.trim().strip_prefix("gitdir:").and_then(|g| repo.join(g.trim()).canonicalize().ok()) else {
         return Vec::new();
     };
-    let common = std::fs::read_to_string(gitdir.join("commondir")).ok().and_then(|c| gitdir.join(c.trim()).canonicalize().ok());
-    std::iter::once(gitdir).chain(common).collect()
+    let Some(worktrees) = gitdir.parent().filter(|p| p.file_name().is_some_and(|n| n == "worktrees")) else {
+        return Vec::new();
+    };
+    let Some(common) = worktrees.parent() else { return Vec::new() };
+    let commondir = std::fs::read_to_string(gitdir.join("commondir")).ok().and_then(|c| gitdir.join(c.trim()).canonicalize().ok());
+    if commondir.as_deref() != Some(common) || !gitdir.join("HEAD").is_file() || !common.join("HEAD").is_file() {
+        return Vec::new();
+    }
+    vec![gitdir.clone(), common.to_path_buf()]
 }
 
 fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -872,6 +880,20 @@ pub(crate) mod tests {
 
     fn head(repo: &Path) -> String {
         git(repo, &["rev-parse", "HEAD"]).unwrap()
+    }
+
+    #[test]
+    fn linked_git_dirs_follow_real_worktrees_only() {
+        let (dir, _, local, _) = setup();
+        assert!(linked_git_dirs(&local).is_empty(), "an ordinary repo keeps its git folder inside");
+        let wt = dir.0.join("wt");
+        git(&local, &["worktree", "add", "-b", "wt", wt.to_str().unwrap()]).unwrap();
+        let common = local.join(".git").canonicalize().unwrap();
+        assert_eq!(linked_git_dirs(&wt), vec![common.join("worktrees/wt"), common]);
+        let fake = dir.0.join("fake");
+        std::fs::create_dir(&fake).unwrap();
+        std::fs::write(fake.join(".git"), "gitdir: /\n").unwrap();
+        assert!(linked_git_dirs(&fake).is_empty(), "a hand-made .git file must not get / watched");
     }
 
     #[test]

@@ -741,7 +741,9 @@ impl App {
         use notify::{RecursiveMode, Watcher};
         let Some(w) = &mut self.watcher else { return };
         for (dir, _) in &self.git_dirs {
-            if !dir.starts_with(&self.root) && !self.watched.contains(dir) && w.watch(dir, RecursiveMode::Recursive).is_ok() {
+            // Inside the scanned folder it is watched already; one that holds the scanned folder would be far too much.
+            let outside = !dir.starts_with(&self.root) && !self.root.starts_with(dir);
+            if outside && !self.watched.contains(dir) && w.watch(dir, RecursiveMode::Recursive).is_ok() {
                 self.watched.insert(dir.clone());
             }
         }
