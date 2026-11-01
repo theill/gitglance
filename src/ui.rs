@@ -8,8 +8,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SELECTED_BG: Color = Color::Indexed(237);
 
+thread_local! {
+    static SPUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn spin(tick: usize) -> char {
+    SPUN.set(true);
     SPIN[tick % SPIN.len()]
+}
+
+/// Whether the last `draw` put a spinner on screen, so the run loop knows to keep drawing frames.
+pub fn animating() -> bool {
+    SPUN.get()
 }
 
 pub fn ago(ts: i64) -> String {
@@ -104,6 +114,7 @@ fn trunc(s: &str, w: usize) -> String {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    SPUN.set(false);
     let [head, body, foot] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
     header(f, head, app);

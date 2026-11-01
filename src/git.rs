@@ -173,6 +173,17 @@ fn is_repo(p: &Path) -> bool {
     }
 }
 
+/// Where a linked worktree keeps its HEAD, index and refs: its own folder in the main repo's `.git`, and that `.git`.
+/// Empty for an ordinary repo, whose `.git` is inside it.
+pub fn linked_git_dirs(repo: &Path) -> Vec<PathBuf> {
+    let Ok(s) = std::fs::read_to_string(repo.join(".git")) else { return Vec::new() };
+    let Some(gitdir) = s.trim().strip_prefix("gitdir:").and_then(|g| repo.join(g.trim()).canonicalize().ok()) else {
+        return Vec::new();
+    };
+    let common = std::fs::read_to_string(gitdir.join("commondir")).ok().and_then(|c| gitdir.join(c.trim()).canonicalize().ok());
+    std::iter::once(gitdir).chain(common).collect()
+}
+
 fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth == 0 {
         return;

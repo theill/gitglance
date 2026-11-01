@@ -105,7 +105,7 @@ If the repo has changes and no summary yet, the AI summary starts on its own onc
 
 ## Live dashboard
 
-gitglance re-checks every repo every 5 seconds, and runs `git fetch --all` on all of them every 5 minutes (the first fetch starts right after the opening scan). Changes made elsewhere, by you in an editor or by an agent in another session, show up without a key press:
+gitglance watches the folder for file changes and re-checks a repo as soon as something in it changes, so it uses no CPU while nothing does. A repo that keeps changing (a build, an agent at work) is re-checked at most every 5 seconds. It also runs `git fetch --all` on every repo every 5 minutes (the first fetch starts right after the opening scan). Changes made elsewhere, by you in an editor or by an agent in another session, show up without a key press:
 
 - New, changed or cleaned-up repos appear and disappear from the list, and repos cloned into the folder show up too.
 - Repos that changed get a `●` marker; the detail view says how long ago.
@@ -115,7 +115,7 @@ gitglance re-checks every repo every 5 seconds, and runs `git fetch --all` on al
 Background re-checks are quiet: no spinners. When one finds new changes in a repo, the AI summarizes them once they have stayed the same for 10 seconds, so an agent that is still editing doesn't cause a call per re-check, and the row says "summarizing once the changes settle…" meanwhile. A summary that comes back for changes that have moved on since is dropped, and the newer changes get their own once they settle. Summaries are cached by content, so a repo that goes back to a state it was in before costs nothing. `--no-auto-summary` turns this off. Repos that already had changes when gitglance started are summarized with `S` or `--summarize`.
 
 ```bash
-gitglance ~/code --interval 10 --fetch-every 15   # gentler
+gitglance ~/code --interval 10 --fetch-every 15   # gentler on repos that keep changing
 gitglance ~/code --fetch-every 0                  # never fetch on its own
 gitglance ~/code --interval 0                     # start paused; w resumes
 ```

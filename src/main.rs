@@ -29,8 +29,10 @@ USAGE:
                    changes for half a second does, and so do new changes the live refresh
                    finds once they have stayed the same for 10 seconds
     -i, --interval SECS
-                   re-check every repo this often, so changes made in other sessions show
-                   up on their own (default: 5, 0 starts paused; w toggles it)
+                   changes made in other sessions show up on their own: a repo is re-checked
+                   when its files change, and at most this often while they keep changing
+                   (default: 5, 0 starts paused; w toggles it). Where folders can't be
+                   watched, every repo is re-checked this often instead
     -F, --fetch-every MINS
                    fetch every repo in the background this often, so `behind` stays
                    current (default: 5, 0 turns it off)
@@ -92,6 +94,12 @@ pub struct Repo {
     checking: bool,
     /// Bumped for every scan, so a slow, older result can't overwrite a newer one.
     gen: u64,
+    /// When the last scan started.
+    checked_at: Option<Instant>,
+    /// When a file in the repo first and last changed since its last scan, as the file watcher reported it.
+    touched: Option<(Instant, Instant)>,
+    /// Something in its `.git` changed too (a commit, a checkout, a fetch), so the commit log needs reading again.
+    refs_touched: bool,
     /// When a re-check last found something different, so the list can mark what moved.
     pub changed_at: Option<Instant>,
     /// New changes the live refresh found, waiting to stay put for `SETTLE` before the AI summarizes them.
@@ -123,6 +131,9 @@ impl Repo {
             busy: false,
             checking: false,
             gen: 0,
+            checked_at: None,
+            touched: None,
+            refs_touched: false,
             changed_at: None,
             settling: None,
             activity: None,
@@ -155,7 +166,8 @@ enum Msg {
         gen: u64,
         quiet: bool,
         status: Box<Result<git::Status, String>>,
-        log: Result<Vec<git::LogCommit>, String>,
+        /// `None` when the scan skipped the log because no commit or ref could have moved.
+        log: Option<Result<Vec<git::LogCommit>, String>>,
         context: Option<String>,
         cached: Option<String>,
     },
@@ -165,6 +177,10 @@ enum Msg {
     GitDone { path: PathBuf, result: Result<String, String> },
     Synced { path: PathBuf, result: Result<git::SyncOutcome, String> },
     Activity { path: PathBuf, result: Result<git::Activity, String> },
+    /// Files changed below the scanned folder, from the file watcher.
+    Changed(Vec<PathBuf>),
+    /// The watcher dropped events, so anything may have changed.
+    ChangesLost,
 }
 
 /// What can be selected and opened on the detail page, in display order.
@@ -357,12 +373,23 @@ pub struct App {
     pub syncing: Option<SyncProgress>,
     /// Track Git writes separately from scans to keep operations from overlapping.
     operating: HashSet<PathBuf>,
-    /// Live mode: re-check every repo every `interval`, and fetch every `fetch_every`.
+    /// Live mode: re-check a repo when the file watcher sees it change (at most every `interval` while it keeps
+    /// changing), and fetch every `fetch_every`. Without a watcher, every repo is re-checked every `interval`.
     pub live: bool,
     interval: Duration,
     pub fetch_every: Option<Duration>,
+    /// When the repo list was last read from disk.
     last_check: Instant,
     pub last_fetch: Option<Instant>,
+    watcher: Option<notify::RecommendedWatcher>,
+    /// Folders watched on top of the scanned one: linked worktrees' git folders that live outside it.
+    watched: HashSet<PathBuf>,
+    /// A linked worktree's git folders, so a commit made there re-checks the worktree as well.
+    git_dirs: Vec<(PathBuf, PathBuf)>,
+    /// Something changed outside the known repos (a clone, a deleted folder, the ignore file); when it first did.
+    rediscover_at: Option<Instant>,
+    /// The watcher dropped events, so the next refresh re-checks everything.
+    changes_lost: bool,
     /// A command to hand the terminal to, in a repo (an empty command means `$SHELL`). The run loop does it,
     /// since it owns the terminal.
     handoff: Option<(PathBuf, Vec<String>)>,
@@ -440,6 +467,11 @@ impl App {
             fetch_every,
             last_check: Instant::now(),
             last_fetch: None,
+            watcher: None,
+            watched: HashSet::new(),
+            git_dirs: Vec::new(),
+            rediscover_at: None,
+            changes_lost: false,
             handoff: None,
             auto_summary,
             opened: None,
@@ -641,10 +673,35 @@ impl App {
         if self.syncing.is_some() {
             return;
         }
-        self.last_check = Instant::now();
+        self.changes_lost = false;
         if fetch {
             self.last_fetch = Some(Instant::now());
         }
+        self.reload_repos();
+        let paths: Vec<PathBuf> = self
+            .repos
+            .iter_mut()
+            .filter(|r| !r.ignored && !self.operating.contains(&r.path) && !(quiet && (r.busy || r.checking)))
+            .map(|r| {
+                r.refs_touched = true;
+                r.path.clone()
+            })
+            .collect();
+        self.spawn_scan(paths, fetch, quiet);
+    }
+
+    /// Something appeared or went away outside the known repos (a clone, a deleted folder, the ignore file): picks up
+    /// the new list and scans only the repos that weren't in it.
+    fn rediscover(&mut self) {
+        self.rediscover_at = None;
+        let before: HashSet<PathBuf> = self.repos.iter().filter(|r| !r.ignored).map(|r| r.path.clone()).collect();
+        self.reload_repos();
+        let new = self.repos.iter().filter(|r| !r.ignored && !before.contains(&r.path)).map(|r| r.path.clone()).collect();
+        self.spawn_scan(new, false, true);
+    }
+
+    fn reload_repos(&mut self) {
+        self.last_check = Instant::now();
         let paths = git::discover(&self.root, self.depth);
         let mut old: HashMap<PathBuf, Repo> = self.repos.drain(..).map(|r| (r.path.clone(), r)).collect();
         let root = self.root.clone();
@@ -654,13 +711,64 @@ impl App {
         for r in &mut self.repos {
             r.ignored = self.ignore.is_ignored(&r.rel);
         }
-        let paths: Vec<PathBuf> = self
-            .repos
-            .iter()
-            .filter(|r| !r.ignored && !self.operating.contains(&r.path) && !(quiet && (r.busy || r.checking)))
-            .map(|r| r.path.clone())
-            .collect();
-        self.spawn_scan(paths, fetch, quiet);
+        self.git_dirs = self.repos.iter().flat_map(|r| git::linked_git_dirs(&r.path).into_iter().map(|d| (d, r.path.clone()))).collect();
+        self.watch_git_dirs();
+    }
+
+    /// Watches the scanned folder for changes, so the live refresh only re-checks repos that changed and costs
+    /// nothing while nothing does. Without a watcher, it falls back to re-checking everything every `interval`.
+    fn watch(&mut self) {
+        use notify::{event::{AccessKind, AccessMode}, EventKind, RecursiveMode, Watcher};
+        let tx = self.tx.clone();
+        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let msg = match res {
+                Ok(e) if e.need_rescan() => Msg::ChangesLost,
+                // Reads (inotify reports git's own) change nothing.
+                Ok(e) if matches!(e.kind, EventKind::Access(a) if a != AccessKind::Close(AccessMode::Write)) => return,
+                Ok(e) => Msg::Changed(e.paths),
+                Err(_) => Msg::ChangesLost,
+            };
+            let _ = tx.send(msg);
+        });
+        match watcher.and_then(|mut w| w.watch(&self.root, RecursiveMode::Recursive).map(|_| w)) {
+            Ok(w) => self.watcher = Some(w),
+            Err(e) => self.notice = Some(format!("Can't watch for changes ({e}), re-checking every {}s instead", self.interval.as_secs())),
+        }
+        self.watch_git_dirs();
+    }
+
+    fn watch_git_dirs(&mut self) {
+        use notify::{RecursiveMode, Watcher};
+        let Some(w) = &mut self.watcher else { return };
+        for (dir, _) in &self.git_dirs {
+            if !dir.starts_with(&self.root) && !self.watched.contains(dir) && w.watch(dir, RecursiveMode::Recursive).is_ok() {
+                self.watched.insert(dir.clone());
+            }
+        }
+    }
+
+    /// Marks the repo a changed file belongs to, for `refresh_if_due` to re-check.
+    fn touch(&mut self, p: &Path) {
+        let now = Instant::now();
+        for (dir, repo) in &self.git_dirs {
+            if p.starts_with(dir) {
+                if let Some(r) = self.repos.iter_mut().find(|r| r.path == *repo) {
+                    r.touched = Some((r.touched.map_or(now, |(first, _)| first), now));
+                    r.refs_touched = true;
+                }
+            }
+        }
+        // The deepest match, since the scanned folder can be a repo itself.
+        let owner = self.repos.iter_mut().filter(|r| p.starts_with(&r.path)).max_by_key(|r| r.path.as_os_str().len());
+        let Some(r) = owner else {
+            self.rediscover_at.get_or_insert(now);
+            return;
+        };
+        r.touched = Some((r.touched.map_or(now, |(first, _)| first), now));
+        r.refs_touched |= p.strip_prefix(&r.path).is_ok_and(|rest| rest.starts_with(".git"));
+        if r.rel.is_empty() {
+            self.rediscover_at.get_or_insert(now);
+        }
     }
 
     fn spawn_scan(&mut self, paths: Vec<PathBuf>, fetch: bool, quiet: bool) {
@@ -673,7 +781,12 @@ impl App {
                 } else {
                     r.busy = true;
                 }
-                jobs.push((r.path.clone(), r.gen));
+                // Edits to files alone can't move a commit, so a re-check for those skips the log.
+                let log = !quiet || fetch || r.refs_touched || r.log.is_none() || self.watcher.is_none();
+                r.checked_at = Some(Instant::now());
+                r.touched = None;
+                r.refs_touched = false;
+                jobs.push((r.path.clone(), r.gen, log));
             }
         }
         if fetch && !quiet {
@@ -685,12 +798,12 @@ impl App {
             let (jobs, tx) = (jobs.clone(), self.tx.clone());
             thread::spawn(move || loop {
                 let next = jobs.lock().unwrap().pop();
-                let Some((path, gen)) = next else { break };
+                let Some((path, gen, log)) = next else { break };
                 if fetch {
                     let _ = git::fetch(&path);
                 }
                 let status = git::status(&path);
-                let log = git::recent(&path);
+                let log = log.then(|| git::recent(&path));
                 let (context, cached) = match &status {
                     Ok(s) if s.needs_attention() => {
                         let c = ai::build_context(&path, s);
@@ -1095,8 +1208,36 @@ impl App {
             Some(t) => t.elapsed() >= every,
             None => !self.repos.iter().any(|r| r.busy),
         });
-        if fetch || self.last_check.elapsed() >= self.interval {
+        let Some(_) = &self.watcher else {
+            if fetch || self.last_check.elapsed() >= self.interval {
+                self.rescan(fetch, true);
+            }
+            return;
+        };
+        if fetch || self.changes_lost {
             self.rescan(fetch, true);
+            return;
+        }
+        // A repo is re-checked once a burst of changes (a commit, a checkout) has been quiet for `QUIET`, or every
+        // `interval` while it keeps changing (a build, an agent editing), and never more than once per `GAP`.
+        const QUIET: Duration = Duration::from_millis(300);
+        const GAP: Duration = Duration::from_secs(1);
+        if self.rediscover_at.is_some_and(|t| t.elapsed() >= QUIET) && self.last_check.elapsed() >= GAP {
+            self.rediscover();
+        }
+        let interval = self.interval;
+        let due: Vec<PathBuf> = self
+            .repos
+            .iter()
+            .filter(|r| !r.ignored && !r.busy && !r.checking && !self.operating.contains(&r.path))
+            .filter(|r| {
+                r.touched.is_some_and(|(first, last)| last.elapsed() >= QUIET || first.elapsed() >= interval)
+                    && r.checked_at.is_none_or(|t| t.elapsed() >= GAP)
+            })
+            .map(|r| r.path.clone())
+            .collect();
+        if !due.is_empty() {
+            self.spawn_scan(due, false, true);
         }
     }
 
@@ -1169,7 +1310,7 @@ impl App {
                 let r = &mut self.repos[i];
                 r.status = Some(status);
                 // A repo with no commits yet, or one git can't read right now, keeps what it had.
-                if let Ok(mut log) = log {
+                if let Some(Ok(mut log)) = log {
                     if let Some(old) = &r.log {
                         for c in &mut log {
                             c.arrived = match old.iter().find(|o| o.hash == c.hash) {
@@ -1224,6 +1365,12 @@ impl App {
                 self.spawn_scan(vec![path], false, false);
             }
             Msg::Synced { path, result } => self.sync_done(path, result),
+            Msg::Changed(paths) => {
+                for p in &paths {
+                    self.touch(p);
+                }
+            }
+            Msg::ChangesLost => self.changes_lost = true,
             Msg::Activity { path, result } => {
                 if let Some(i) = self.repo_idx(&path) {
                     self.repos[i].activity = Some(result);
@@ -1701,15 +1848,22 @@ fn hand_off(terminal: &mut ratatui::DefaultTerminal, dir: &Path, cmd: &[String])
 
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
     use ratatui::crossterm::{execute, terminal::SetTitle};
+    // Idle, it draws once a second for the clocks ("fetched 2m ago") and wakes only to check for messages.
+    const FRAME: Duration = Duration::from_millis(80);
+    const IDLE: Duration = Duration::from_millis(250);
     let mut title = String::new();
+    let mut changed = true;
+    let mut drawn = Instant::now();
     loop {
         while let Ok(msg) = app.rx.try_recv() {
             app.handle(msg);
+            changed = true;
         }
         if let Some((dir, cmd)) = app.handoff.take() {
             hand_off(terminal, &dir, &cmd)?;
             title.clear();
             app.spawn_scan(vec![dir], false, false);
+            changed = true;
         }
         app.refresh_if_due();
         app.summarize_if_lingering();
@@ -1719,15 +1873,24 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
             let _ = execute!(io::stdout(), SetTitle(&t));
             title = t;
         }
-        terminal.draw(|f| ui::draw(f, app))?;
-        if event::poll(Duration::from_millis(80))? {
+        let animating = ui::animating();
+        if changed || animating || drawn.elapsed() >= Duration::from_secs(1) {
+            if animating {
+                app.tick = app.tick.wrapping_add(1);
+            }
+            terminal.draw(|f| ui::draw(f, app))?;
+            drawn = Instant::now();
+            changed = false;
+        }
+        if event::poll(if ui::animating() { FRAME } else { IDLE })? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press && app.on_key(k) {
                     return Ok(());
                 }
             }
+            // A key, a resize or a focus change: draw right away.
+            changed = true;
         }
-        app.tick = app.tick.wrapping_add(1);
     }
 }
 
@@ -1771,6 +1934,7 @@ fn main() -> io::Result<()> {
     }
     let root = root.map_or_else(std::env::current_dir, Ok)?.canonicalize()?;
     let mut app = App::new(root, depth, auto, auto_summary, interval, fetch_every);
+    app.watch();
     app.rescan(false, false);
 
     let mut terminal = ratatui::init();

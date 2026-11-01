@@ -5,6 +5,7 @@ edition = "2021"
 description = "Fast TUI overview of pending git changes across all repos in a folder, with AI summaries"
 
 [dependencies]
+notify = "8"
 ratatui = "0.30"
 
 [profile.release]
