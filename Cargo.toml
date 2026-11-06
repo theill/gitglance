@@ -7,6 +7,7 @@ description = "Fast TUI overview of pending git changes across all repos in a fo
 [dependencies]
 notify = "8"
 ratatui = "0.30"
+terminal-colorsaurus = "1"
 
 [profile.release]
 opt-level = 3

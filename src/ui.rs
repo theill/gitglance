@@ -6,7 +6,6 @@ use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, Wrap}
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const SELECTED_BG: Color = Color::Indexed(237);
 
 thread_local! {
     static SPUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -630,7 +629,7 @@ fn list(f: &mut Frame, area: Rect, app: &mut App) {
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
-        .row_highlight_style(Style::new().bg(SELECTED_BG))
+        .row_highlight_style(Style::new().bg(crate::theme::selected_bg()))
         .highlight_symbol("▌ ");
     app.table_state.select(Some(pos));
     f.render_stateful_widget(table, area.inner(Margin::new(0, 1)), &mut app.table_state);
@@ -832,7 +831,7 @@ fn commits(f: &mut Frame, area: Rect, app: &mut App) {
         let mut spans = vec![if selected { "▌ ".cyan().bold() } else { "  ".into() }];
         spans.extend(line.spans);
         let line = Line::from(spans);
-        lines.push(if selected { line.style(Style::new().bg(SELECTED_BG)) } else { line });
+        lines.push(if selected { line.style(Style::new().bg(crate::theme::selected_bg())) } else { line });
     }
 
     // Keep the selection on screen, and its repo's header too when the selection is that repo's first commit.
@@ -913,7 +912,7 @@ fn item_line(spans: Vec<Span<'static>>, selected: bool) -> Line<'static> {
     all.extend(spans);
     let line = Line::from(all);
     if selected {
-        line.style(Style::new().bg(SELECTED_BG))
+        line.style(Style::new().bg(crate::theme::selected_bg()))
     } else {
         line
     }

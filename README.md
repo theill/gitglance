@@ -120,6 +120,7 @@ gitglance watches the folder for file changes and re-checks a repo as soon as so
 - Repos that changed get a `●` marker; the detail view says how long ago.
 - `↓N` appears once a fetch sees new commits upstream, so you know to pull.
 - The terminal window title shows the count, like `3 pending · ↓1 · gitglance ~/code`, so you can see it from a tab or taskbar. The title is put back when gitglance quits.
+- Light and dark: gitglance asks the terminal for its background color, so the selected row suits either. Terminals that follow the system appearance are asked again every few seconds, so a switch shows up while it runs. Terminals that don't answer get `COLORFGBG` or, on macOS, the system appearance.
 
 Background re-checks are quiet: no spinners. When one finds new changes in a repo, the AI summarizes them once they have stayed the same for 10 seconds, so an agent that is still editing doesn't cause a call per re-check, and the row says "summarizing once the changes settle…" meanwhile. A summary that comes back for changes that have moved on since is dropped, and the newer changes get their own once they settle. Summaries are cached by content, so a repo that goes back to a state it was in before costs nothing. `--no-auto-summary` turns this off. Repos that already had changes when gitglance started are summarized with `S` or `--summarize`.
 

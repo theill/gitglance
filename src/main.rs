@@ -1,6 +1,7 @@
 mod ai;
 mod git;
 mod ignore;
+mod theme;
 mod ui;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -1868,6 +1869,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
     let mut title = String::new();
     let mut changed = true;
     let mut drawn = Instant::now();
+    let mut themed = Instant::now();
     loop {
         while let Ok(msg) = app.rx.try_recv() {
             app.handle(msg);
@@ -1878,6 +1880,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
             title.clear();
             app.spawn_scan(vec![dir], false, false);
             changed = true;
+        }
+        // The terminal may follow the system between light and dark while gitglance runs.
+        if themed.elapsed() >= theme::RECHECK {
+            themed = Instant::now();
+            changed |= theme::recheck();
         }
         app.refresh_if_due();
         app.summarize_if_lingering();
@@ -1969,6 +1976,8 @@ fn main() -> io::Result<()> {
         app.open_detail(0);
     }
 
+    // Before the TUI takes the screen, so the answer is read here and not as keys.
+    theme::detect();
     let mut terminal = ratatui::init();
     write_raw(PUSH_TITLE);
     let result = run(&mut terminal, &mut app);
