@@ -35,6 +35,15 @@ To update, run `gitglance update`. It reinstalls the latest version from GitHub 
 
 AI summaries and drafted commit messages are optional. They need the [Claude Code](https://claude.com/claude-code) CLI (`claude`) on your `PATH`, or another command set through `GITGLANCE_AI_CMD` (see [AI summaries](#ai-summaries)). Everything else works without it.
 
+## One repo in a side pane
+
+`gitglance --repo` shows only the repo you're in (from any subfolder), straight on its [details page](#repo-details): pending work, incoming and unpushed commits, commit, push and pull. Esc quits instead of going back to a list. It's meant for a pane next to your shell; Lyn opens it with ⌘G.
+
+```bash
+gitglance --repo            # the repo the current folder is in
+gitglance --repo ~/code/api
+```
+
 ## Keys
 
 | List | |

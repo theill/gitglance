@@ -18,10 +18,13 @@ const HELP: &str = "gitglance - overview of pending git changes in every repo be
 
 USAGE:
     gitglance [DIR] [--depth N] [--summarize] [--interval SECS] [--fetch-every MINS]
+    gitglance --repo [DIR]   just the repo DIR is in, opened on its details; esc quits
     gitglance update   reinstall the latest gitglance from GitHub (needs cargo)
 
     DIR            folder to scan (default: current directory)
     -d, --depth N  how deep to look for repos below DIR (default: 2)
+    --repo         show only the repo that DIR is in, straight on its details page, and
+                   quit on esc. For a side pane in a terminal (Lyn opens it with cmd+G)
     -s, --summarize
                    ask the AI for a summary of every repo with changes on start
     --no-auto-summary
@@ -347,6 +350,8 @@ pub struct App {
     pub repos: Vec<Repo>,
     ignore: ignore::Ignore,
     pub show_all: bool,
+    /// `--repo`: one repo, kept on its details page; esc there quits instead of going to the list.
+    pub single: bool,
     pub show_ignored: bool,
     pub filter: String,
     pub filtering: bool,
@@ -441,6 +446,7 @@ impl App {
             ignore: ignore_file,
             repos: Vec::new(),
             show_all: false,
+            single: false,
             show_ignored: false,
             filter: String::new(),
             filtering: false,
@@ -1522,12 +1528,17 @@ impl App {
             self.modal = Some(Modal::Help { scroll: 0 });
             return false;
         }
-        match self.view {
+        let quit = match self.view {
             View::List => self.list_key(k),
             View::Detail { .. } => self.detail_key(k),
             View::Diff { .. } => self.diff_key(k),
             View::Commits => self.commits_key(k),
+        };
+        // One repo has no list to go back to: whatever leads there lands on its details again.
+        if self.single && matches!(self.view, View::List) && !self.repos.is_empty() {
+            self.open_detail(0);
         }
+        quit
     }
 
     fn list_key(&mut self, k: KeyEvent) -> bool {
@@ -1673,6 +1684,7 @@ impl App {
         };
         match k.code {
             KeyCode::Char('q') => return true,
+            KeyCode::Esc if self.single => return true,
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
                 self.sel_path = Some(path);
                 self.view = View::List;
@@ -1907,6 +1919,7 @@ fn main() -> io::Result<()> {
     let mut auto_summary = true;
     let mut interval = Duration::from_secs(5);
     let mut fetch_every = Some(Duration::from_secs(5 * 60));
+    let mut single = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -1921,6 +1934,7 @@ fn main() -> io::Result<()> {
             "-d" | "--depth" => depth = args.next().and_then(|v| v.parse().ok()).unwrap_or(depth),
             "-s" | "--summarize" => auto = true,
             "--no-auto-summary" => auto_summary = false,
+            "--repo" => single = true,
             "-i" | "--interval" => {
                 if let Some(secs) = args.next().and_then(|v| v.parse().ok()) {
                     interval = Duration::from_secs(secs);
@@ -1934,10 +1948,26 @@ fn main() -> io::Result<()> {
             other => root = Some(PathBuf::from(other)),
         }
     }
-    let root = root.map_or_else(std::env::current_dir, Ok)?.canonicalize()?;
+    let mut root = root.map_or_else(std::env::current_dir, Ok)?.canonicalize()?;
+    if single {
+        // The repo's top level, so running it from any subfolder shows that repo.
+        match git::git(&root, &["rev-parse", "--show-toplevel"]) {
+            Ok(top) => root = PathBuf::from(top.trim()).canonicalize()?,
+            Err(_) => {
+                eprintln!("gitglance: {} is not in a git repository", root.display());
+                std::process::exit(1);
+            }
+        }
+        depth = 0;
+    }
     let mut app = App::new(root, depth, auto, auto_summary, interval, fetch_every);
+    app.single = single;
+    app.show_all = single;
     app.watch();
     app.rescan(false, false);
+    if single && !app.repos.is_empty() {
+        app.open_detail(0);
+    }
 
     let mut terminal = ratatui::init();
     write_raw(PUSH_TITLE);
@@ -2136,5 +2166,28 @@ mod tests {
         assert!(app.filter.is_empty() && matches!(app.view, View::Commits));
         key(&mut app, KeyCode::Esc);
         assert!(matches!(app.view, View::List));
+    }
+
+    #[test]
+    fn single_repo_mode_stays_on_the_details_page_and_esc_quits() {
+        let dir = git::tests::TestDir::new();
+        let path = dir.0.join("solo");
+        git::git(&dir.0, &["init", "--quiet", "--initial-branch=main", path.to_str().unwrap()]).unwrap();
+        std::fs::write(path.join("new.txt"), "hello\n").unwrap();
+        let mut app = App::new(path.clone(), 0, false, false, Duration::ZERO, None);
+        app.single = true;
+        app.show_all = true;
+        app.rescan(false, false);
+        app.open_detail(0);
+        settle(&mut app);
+        assert_eq!(app.repos.len(), 1);
+        let lines = screen(&mut app);
+        assert!(lines.iter().any(|l| l.contains("close")), "{}", lines.join("\n"));
+        let key = |app: &mut App, code: KeyCode| app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        // The board's way back leads to the details page, not a one-repo list.
+        app.view = View::Commits;
+        assert!(!key(&mut app, KeyCode::Esc));
+        assert!(matches!(&app.view, View::Detail { path: p, .. } if *p == path));
+        assert!(key(&mut app, KeyCode::Esc), "esc on the details page quits");
     }
 }

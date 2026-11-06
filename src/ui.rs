@@ -414,6 +414,16 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("?", "all keys"),
             ("q", "quit"),
         ],
+        View::Detail { .. } if app.single => &[
+            ("esc", "close"),
+            ("⏎", "open"),
+            ("c", "commit"),
+            ("P", "push"),
+            ("u", "pull"),
+            ("d", "diff"),
+            ("A", "agent"),
+            ("?", "all keys"),
+        ],
         View::Detail { .. } => &[
             ("esc", "back"),
             ("⏎", "open"),
